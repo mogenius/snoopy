@@ -5,12 +5,7 @@ use aya_ebpf::{macros::map, maps::HashMap};
 use aya_ebpf::macros::classifier;
 use aya_ebpf::programs::TcContext;
 use aya_log_ebpf::*;
-
-#[repr(C)]
-pub struct Counter {
-    pub packets: u64,
-    pub bytes: u64,
-}
+use snoopy_common::Counter;
 
 #[map(name = "INGRESS_COUNTER")]
 static INGRESS_COUNTER: HashMap<u8, Counter> = HashMap::<u8, Counter>::with_max_entries(1, 0);

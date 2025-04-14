@@ -3,14 +3,22 @@ use std::io::IsTerminal;
 
 use anyhow::Context;
 use aya::programs::{SchedClassifier, TcAttachType};
-use aya::Pod;
 use clap::Parser;
 use pnet::datalink::{self, NetworkInterface};
 use serde::{Deserialize, Serialize};
+use snoopy_common::Counter;
 use tracing_subscriber::util::SubscriberInitExt;
 
-#[derive(Debug, Parser)]
-struct CliArgs {}
+// Snoopy
+#[derive(Debug, Default, Parser, Clone)]
+#[command(version, about)]
+struct Arguments {
+    #[arg(long, default_value = "100")]
+    pub network_device_poll_rate: u64,
+
+    #[arg(long, default_value = "500")]
+    pub metrics_rate: u64,
+}
 
 fn main() -> anyhow::Result<()> {
     if std::env::var("RUST_LOG").is_err() {
@@ -28,7 +36,7 @@ fn main() -> anyhow::Result<()> {
         .finish()
         .init();
 
-    let _args = CliArgs::parse();
+    let args = Arguments::parse();
 
     // Bump the memlock rlimit. This is needed for older kernels that don't use the
     // new memcg based accounting, see https://lwn.net/Articles/837122/
@@ -41,7 +49,7 @@ fn main() -> anyhow::Result<()> {
         tracing::debug!("remove limit on locked memory failed, ret is: {}", ret);
     }
 
-    let (rx, _handle) = watch_network_interfaces();
+    let (rx, _handle) = watch_network_interfaces(args.clone());
 
     let mut ebpf_tasks = HashMap::new();
     loop {
@@ -65,12 +73,15 @@ fn main() -> anyhow::Result<()> {
             InterfaceUpdate::Added { interface } => {
                 let (kill_tx, kill_rx) = crossbeam::channel::bounded::<()>(0);
                 let cloned_interface = interface.clone();
+                let args = args.clone();
                 let handle = std::thread::spawn(move || {
                     let rt = tokio::runtime::Builder::new_current_thread()
                         .enable_io()
                         .build()
                         .unwrap();
-                    if let Err(error) = rt.block_on(attach_ebpf_to_interface(&cloned_interface.name, kill_rx)) {
+                    if let Err(error) =
+                        rt.block_on(attach_ebpf_to_interface(args, &cloned_interface.name, kill_rx))
+                    {
                         tracing::error!(
                             "failed to attach ebpf to interface '{}': {}",
                             cloned_interface.name,
@@ -98,15 +109,6 @@ fn main() -> anyhow::Result<()> {
     }
 }
 
-#[repr(C)]
-#[derive(Debug, Default, Copy, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Counter {
-    pub packets: u64,
-    pub bytes: u64,
-}
-
-unsafe impl Pod for Counter {}
-
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type")]
 struct InterfaceMetrics<'a> {
@@ -118,6 +120,7 @@ struct InterfaceMetrics<'a> {
 }
 
 async fn attach_ebpf_to_interface(
+    args: Arguments,
     iface: &str,
     kill_rx: crossbeam::channel::Receiver<()>,
 ) -> anyhow::Result<()> {
@@ -172,7 +175,7 @@ async fn attach_ebpf_to_interface(
     let mut egress_counter = Counter::default();
 
     loop {
-        std::thread::sleep(std::time::Duration::from_millis(1000));
+        std::thread::sleep(std::time::Duration::from_millis(args.metrics_rate));
         if kill_rx.try_recv().is_ok() {
             break;
         }
@@ -221,14 +224,14 @@ pub enum InterfaceUpdate {
     },
 }
 
-fn watch_network_interfaces() -> (
+fn watch_network_interfaces(args: Arguments) -> (
     crossbeam::channel::Receiver<InterfaceUpdate>,
     std::thread::JoinHandle<()>,
 ) {
     let (tx, rx) = crossbeam::channel::bounded::<InterfaceUpdate>(0);
 
     let handle = std::thread::spawn(move || {
-        let interval = std::time::Duration::from_millis(100);
+        let interval = std::time::Duration::from_millis(args.network_device_poll_rate);
         let mut previous_interfaces = datalink::interfaces();
         for interface in &previous_interfaces {
             if let Err(error) = tx.send(InterfaceUpdate::Added {

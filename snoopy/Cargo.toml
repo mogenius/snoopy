@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-snoopy-common = { path = "../snoopy-common", features = ["user"] }
+snoopy-common = { path = "../snoopy-common", features = ["user", "serde"] }
 
 anyhow = { workspace = true, default-features = true }
 aya = { workspace = true }
@@ -13,14 +13,14 @@ env_logger = { workspace = true }
 libc = { workspace = true }
 log = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "net", "signal"] }
-crossbeam = "0.8.4"
-pnet = { version = "0.35.0", features = ["serde"] }
-serde = { version = "1.0.219", features = ["derive"] }
-serde_json = "1.0.140"
-thiserror = "2.0.12"
-tracing = "0.1.41"
-tracing-appender = "0.2.3"
-tracing-subscriber = { version = "0.3.19", features = ["env-filter", "json"] }
+crossbeam = { workspace = true }
+pnet = { workspace = true, features = ["serde"] }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tracing-appender = { workspace = true }
+tracing-subscriber = { workspace = true, features = ["env-filter", "json"] }
 clap = { workspace = true, features = ["derive"] }
 
 [build-dependencies]
@@ -43,10 +43,3 @@ snoopy-ebpf = { path = "../snoopy-ebpf" }
 [[bin]]
 name = "snoopy"
 path = "src/main.rs"
-
-[profile.release]
-codegen-units = 1
-lto = true
-opt-level = "z"
-panic = "abort"
-strip = "symbols"
