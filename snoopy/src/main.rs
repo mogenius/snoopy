@@ -1,13 +1,19 @@
 use std::collections::HashMap;
-use std::io::IsTerminal;
+use std::ops::Add;
 
 use anyhow::Context;
-use aya::programs::{SchedClassifier, TcAttachType};
+use aya::Pod;
+use aya::programs::SchedClassifier;
+use aya::programs::TcAttachType;
+use aya::programs::Xdp;
+use aya::programs::XdpFlags;
+use aya::programs::tc;
 use clap::Parser;
-use pnet::datalink::{self, NetworkInterface};
-use serde::{Deserialize, Serialize};
-use snoopy_common::Counter;
-use tracing_subscriber::util::SubscriberInitExt;
+use env_logger::Target;
+use pnet::datalink::NetworkInterface;
+use pnet::datalink::{self};
+use serde::Deserialize;
+use serde::Serialize;
 
 // Snoopy
 #[derive(Debug, Default, Parser, Clone)]
@@ -20,23 +26,17 @@ struct Arguments {
     pub metrics_rate: u64,
 }
 
-fn main() -> anyhow::Result<()> {
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
     if std::env::var("RUST_LOG").is_err() {
         unsafe {
             std::env::set_var("RUST_LOG", "info");
         }
     }
 
-    let (non_blocking, _guard) = tracing_appender::non_blocking(std::io::stderr());
-    tracing_subscriber::fmt()
-        .with_writer(non_blocking)
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
-        .event_format(tracing_subscriber::fmt::format().json())
-        .with_ansi(std::io::stderr().is_terminal())
-        .finish()
-        .init();
-
     let args = Arguments::parse();
+
+    env_logger::builder().target(Target::Stderr).init();
 
     // Bump the memlock rlimit. This is needed for older kernels that don't use the
     // new memcg based accounting, see https://lwn.net/Articles/837122/
@@ -46,65 +46,62 @@ fn main() -> anyhow::Result<()> {
     };
     let ret = unsafe { libc::setrlimit(libc::RLIMIT_MEMLOCK, &rlim) };
     if ret != 0 {
-        tracing::debug!("remove limit on locked memory failed, ret is: {}", ret);
+        log::debug!("remove limit on locked memory failed, ret is: {}", ret);
     }
 
-    let (rx, _handle) = watch_network_interfaces(args.clone());
-
+    let mut interface_update_interval = tokio::time::interval(std::time::Duration::from_millis(args.network_device_poll_rate));
+    let mut network_interfaces = vec![];
     let mut ebpf_tasks = HashMap::new();
+
     loop {
-        let event = match rx.recv() {
-            Ok(event) => event,
-            Err(error) => {
-                tracing::error!(
-                    message = "failed to receive interface update",
-                    "error" = error.to_string()
-                );
-                continue;
-            }
-        };
+        interface_update_interval.tick().await;
+        let network_interface_updates = update_network_interfaces(&mut network_interfaces);
+        for event in network_interface_updates.iter() {
+            log::info!("received event: {}", serde_json::to_string(&event).unwrap());
 
-        tracing::info!(
-            message = "received event",
-            "event" = serde_json::to_string(&event).unwrap()
-        );
-
-        match event {
-            InterfaceUpdate::Added { interface } => {
-                let (kill_tx, kill_rx) = crossbeam::channel::bounded::<()>(0);
-                let cloned_interface = interface.clone();
-                let args = args.clone();
-                let handle = std::thread::spawn(move || {
-                    let rt = tokio::runtime::Builder::new_current_thread()
-                        .enable_io()
-                        .build()
-                        .unwrap();
-                    if let Err(error) =
-                        rt.block_on(attach_ebpf_to_interface(args, &cloned_interface.name, kill_rx))
+            match event {
+                InterfaceUpdate::Added { interface } => {
+                    let (kill_tx, kill_rx) = tokio::sync::oneshot::channel::<()>();
+                    let cloned_interface = interface.clone();
+                    let args = args.clone();
+                    let handle = tokio::spawn(attach_to_interface(args, cloned_interface.name.clone(), kill_rx));
+                    ebpf_tasks.insert(interface.name.clone(), (kill_tx, handle));
+                }
+                InterfaceUpdate::Removed { interface } => {
+                    log::info!("interface was removed: {}", interface);
+                    if let Some((_, (kill_tx, handle))) =
+                        ebpf_tasks.remove_entry(interface.name.as_str())
                     {
-                        tracing::error!(
-                            "failed to attach ebpf to interface '{}': {}",
-                            cloned_interface.name,
-                            error.to_string()
-                        );
-                    };
-                });
-                ebpf_tasks.insert(interface.name, (kill_tx, handle));
-            }
-            InterfaceUpdate::Removed { interface } => {
-                tracing::info!("interface was removed: {}", interface);
-                if let Some((_, (kill_tx, handle))) =
-                    ebpf_tasks.remove_entry(interface.name.as_str())
-                {
-                    let _ = kill_tx.send(());
-                    if let Err(error) = handle.join() {
-                        tracing::error!("failed to join worker thread: {:?}", error);
+                        let _ = kill_tx.send(());
+                        if handle.await.is_err() {
+                            log::error!("failed to join worker thread");
+                        }
                     }
                 }
+                InterfaceUpdate::Changed { previous, new } => {
+                    log::info!("interface changed: {} -> {}", previous, new);
+                }
             }
-            InterfaceUpdate::Changed { previous, new } => {
-                tracing::info!("interface changed: {} -> {}", previous, new);
-            }
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Debug, Default, Copy, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Counter {
+    pub packets: u64,
+    pub bytes: u64,
+}
+
+unsafe impl Pod for Counter {}
+
+impl Add for Counter {
+    type Output = Counter;
+
+    fn add(self, rhs: Self) -> Self::Output {
+        Counter {
+            packets: self.packets + rhs.packets,
+            bytes: self.bytes + rhs.bytes,
         }
     }
 }
@@ -119,12 +116,12 @@ struct InterfaceMetrics<'a> {
     tx_bytes: u64,
 }
 
-async fn attach_ebpf_to_interface(
+async fn attach_to_interface(
     args: Arguments,
-    iface: &str,
-    kill_rx: crossbeam::channel::Receiver<()>,
+    iface: String,
+    mut kill_rx: tokio::sync::oneshot::Receiver<()>,
 ) -> anyhow::Result<()> {
-    tracing::info!("opening ebpf module for interface {}", iface);
+    log::info!("opening ebpf module for interface {iface}");
 
     let rx_bytes = std::fs::read_to_string(format!("/sys/class/net/{iface}/statistics/rx_bytes"))
         .map(|data| data.trim().parse::<u64>().unwrap_or(0))
@@ -135,18 +132,26 @@ async fn attach_ebpf_to_interface(
 
     let ebpf_program = aya::include_bytes_aligned!(concat!(env!("OUT_DIR"), "/snoopy"));
     let mut ebpf = aya::Ebpf::load(ebpf_program).with_context(|| "failed to load ebpf program")?;
-    if let Err(e) = aya_log::EbpfLogger::init(&mut ebpf) {
+    if let Err(error) = aya_log::EbpfLogger::init_with_logger(&mut ebpf, log::logger()) {
         // This can happen if you remove all log statements from your eBPF program.
-        tracing::warn!("failed to initialize eBPF logger: {}", e);
+        log::warn!("failed to initialize eBPF logger: {error}");
     }
-    let ingress_program: &mut SchedClassifier = ebpf
-        .program_mut("update_tc_ingress")
-        .expect("could not find program with name `update_tc_ingress`")
-        .try_into()?;
+
+    let _ = tc::qdisc_add_clsact(iface.as_str());
+
+    // let ingress_program: &mut SchedClassifier = ebpf
+    //     .program_mut("update_tc_ingress")
+    //     .expect("could not find program with name `update_tc_ingress`")
+    //     .try_into()?;
+    // ingress_program.load()?;
+    // ingress_program
+    //     .attach(iface.as_str(), TcAttachType::Ingress)
+    //     .context("failed to attach the TcAttachType::Ingress program")?;
+
+    let ingress_program: &mut Xdp = ebpf.program_mut("update_xdp_ingress").unwrap().try_into()?;
     ingress_program.load()?;
-    ingress_program
-        .attach(iface, TcAttachType::Ingress)
-        .context("failed to attach the TcAttachType::Ingress program")?;
+    ingress_program.attach(iface.as_str(), XdpFlags::default())
+            .context("failed to attach the XDP program with default flags - try changing XdpFlags::default() to XdpFlags::SKB_MODE")?;
 
     let egress_program: &mut SchedClassifier = ebpf
         .program_mut("update_tc_egress")
@@ -154,57 +159,65 @@ async fn attach_ebpf_to_interface(
         .try_into()?;
     egress_program.load()?;
     egress_program
-        .attach(iface, TcAttachType::Egress)
+        .attach(iface.as_str(), TcAttachType::Egress)
         .context("failed to attach the TcAttachType::Egress program")?;
 
-    let ingress_map: aya::maps::HashMap<_, u8, Counter> = aya::maps::HashMap::try_from(
-        ebpf.map("INGRESS_COUNTER")
-            .expect("could not find map with name `INGRESS_COUNTER`"),
-    )
-    .expect("failed to convert type of map");
+    tokio::task::spawn(async move {
+        let mut last_ingress_counter = Counter::default();
+        let mut last_egress_counter = Counter::default();
+        let mut ingress_counter: Counter;
+        let mut egress_counter: Counter;
 
-    let egress_map: aya::maps::HashMap<_, u8, Counter> = aya::maps::HashMap::try_from(
-        ebpf.map("EGRESS_COUNTER")
-            .expect("could not find map with name `EGRESS_COUNTER`"),
-    )
-    .expect("failed to convert type of map");
+        let ingress_map: aya::maps::PerCpuArray<_, Counter> = aya::maps::PerCpuArray::try_from(
+            ebpf.map("INGRESS_COUNTER")
+                .expect("could not find map with name `INGRESS_COUNTER`"),
+        )
+        .expect("failed to convert type of map");
 
-    let mut last_ingress_counter = Counter::default();
-    let mut last_egress_counter = Counter::default();
-    let mut ingress_counter = Counter::default();
-    let mut egress_counter = Counter::default();
+        let egress_map: aya::maps::PerCpuArray<_, Counter> = aya::maps::PerCpuArray::try_from(
+            ebpf.map("EGRESS_COUNTER")
+                .expect("could not find map with name `EGRESS_COUNTER`"),
+        )
+        .expect("failed to convert type of map");
 
-    loop {
-        std::thread::sleep(std::time::Duration::from_millis(args.metrics_rate));
-        if kill_rx.try_recv().is_ok() {
-            break;
+        let mut check_interval = tokio::time::interval(std::time::Duration::from_millis(args.metrics_rate));
+
+        loop {
+            tokio::select! {
+                _ = &mut kill_rx => {
+                    break;
+                }
+                _ = check_interval.tick() => {
+                    ingress_counter = Counter::default();
+                    for counter in ingress_map.iter().flatten() {
+                        ingress_counter = ingress_counter + *counter.first().unwrap();
+                    }
+        
+                    egress_counter = Counter::default();
+                    for counter in egress_map.iter().flatten() {
+                        egress_counter = egress_counter + *counter.first().unwrap();
+                    }
+        
+                    if last_egress_counter != egress_counter || last_ingress_counter != ingress_counter {
+                        let metrics = InterfaceMetrics {
+                            interface: iface.as_str(),
+                            ingress: ingress_counter,
+                            egress: egress_counter,
+                            rx_bytes,
+                            tx_bytes,
+                        };
+        
+                        println!("{}", serde_json::to_string(&metrics).unwrap());
+                    }
+        
+                    last_ingress_counter = ingress_counter;
+                    last_egress_counter = egress_counter;
+                }
+            }
         }
 
-        if let Ok(counter) = ingress_map.get(&0, 0) {
-            ingress_counter = counter;
-        };
-
-        if let Ok(counter) = egress_map.get(&0, 0) {
-            egress_counter = counter;
-        };
-
-        if last_egress_counter != egress_counter || last_ingress_counter != ingress_counter {
-            let metrics = InterfaceMetrics {
-                interface: iface,
-                ingress: ingress_counter,
-                egress: egress_counter,
-                rx_bytes,
-                tx_bytes,
-            };
-
-            println!("{}", serde_json::to_string(&metrics).unwrap());
-        }
-
-        last_ingress_counter = ingress_counter;
-        last_egress_counter = egress_counter;
-    }
-
-    tracing::info!("closing ebpf module for interface {}", iface);
+        log::info!("closed ebpf module for interface {iface}");
+    });
 
     Ok(())
 }
@@ -224,77 +237,45 @@ pub enum InterfaceUpdate {
     },
 }
 
-fn watch_network_interfaces(args: Arguments) -> (
-    crossbeam::channel::Receiver<InterfaceUpdate>,
-    std::thread::JoinHandle<()>,
-) {
-    let (tx, rx) = crossbeam::channel::bounded::<InterfaceUpdate>(0);
+fn update_network_interfaces(
+    network_interfaces: &mut Vec<NetworkInterface>,
+) -> Vec<InterfaceUpdate> {
+    let new_interfaces = datalink::interfaces();
+    let mut updates = vec![];
 
-    let handle = std::thread::spawn(move || {
-        let interval = std::time::Duration::from_millis(args.network_device_poll_rate);
-        let mut previous_interfaces = datalink::interfaces();
-        for interface in &previous_interfaces {
-            if let Err(error) = tx.send(InterfaceUpdate::Added {
-                interface: interface.to_owned(),
-            }) {
-                tracing::error!(
-                    message = "failed to send interface update",
-                    "error" = error.to_string()
-                );
+    for new_interface in new_interfaces.iter() {
+        let previous_interface = network_interfaces
+            .iter_mut()
+            .find(|interface| new_interface.name.as_str() == interface.name);
+        let previous_interface = match previous_interface {
+            Some(previous_interface) => previous_interface,
+            None => {
+                updates.push(InterfaceUpdate::Added {
+                    interface: new_interface.clone(),
+                });
+                continue;
             }
+        };
+        if new_interface != previous_interface {
+            updates.push(InterfaceUpdate::Changed {
+                previous: previous_interface.clone(),
+                new: new_interface.clone(),
+            });
+            continue;
         }
-        loop {
-            std::thread::sleep(interval);
-            let new_interfaces = datalink::interfaces();
-            for new_interface in &new_interfaces {
-                let previous_interface = previous_interfaces
-                    .iter()
-                    .find(|interface| new_interface.name.as_str() == interface.name);
-                let previous_interface = match previous_interface {
-                    Some(previous_interface) => previous_interface,
-                    None => {
-                        if let Err(error) = tx.send(InterfaceUpdate::Added {
-                            interface: new_interface.to_owned(),
-                        }) {
-                            tracing::error!(
-                                message = "failed to send interface update",
-                                "error" = error.to_string()
-                            );
-                        }
-                        continue;
-                    }
-                };
-                if new_interface != previous_interface {
-                    if let Err(error) = tx.send(InterfaceUpdate::Changed {
-                        previous: previous_interface.to_owned(),
-                        new: new_interface.to_owned(),
-                    }) {
-                        tracing::error!(
-                            message = "failed to send interface update",
-                            "error" = error.to_string()
-                        );
-                    }
-                    continue;
-                }
-            }
-            for previous_interface in &previous_interfaces {
-                if !new_interfaces
-                    .iter()
-                    .any(|interface| previous_interface.name == interface.name)
-                {
-                    if let Err(error) = tx.send(InterfaceUpdate::Removed {
-                        interface: previous_interface.to_owned(),
-                    }) {
-                        tracing::error!(
-                            message = "failed to send interface update",
-                            "error" = error.to_string()
-                        );
-                    }
-                }
-            }
-            previous_interfaces = new_interfaces;
+    }
+    for previous_interface in network_interfaces.iter() {
+        if !new_interfaces
+            .iter()
+            .any(|interface| previous_interface.name == interface.name)
+        {
+            updates.push(InterfaceUpdate::Removed {
+                interface: previous_interface.clone(),
+            });
         }
-    });
+    }
 
-    (rx, handle)
+    let _ = std::mem::replace(network_interfaces, new_interfaces);
+
+    updates
 }

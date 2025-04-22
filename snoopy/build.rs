@@ -1,4 +1,5 @@
-use anyhow::{anyhow, Context as _};
+use anyhow::Context as _;
+use anyhow::anyhow;
 use aya_build::cargo_metadata;
 
 fn main() -> anyhow::Result<()> {
