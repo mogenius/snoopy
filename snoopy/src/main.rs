@@ -49,7 +49,9 @@ async fn main() -> anyhow::Result<()> {
         log::debug!("remove limit on locked memory failed, ret is: {}", ret);
     }
 
-    let mut interface_update_interval = tokio::time::interval(std::time::Duration::from_millis(args.network_device_poll_rate));
+    let mut interface_update_interval = tokio::time::interval(std::time::Duration::from_millis(
+        args.network_device_poll_rate,
+    ));
     let mut network_interfaces = vec![];
     let mut ebpf_tasks = HashMap::new();
 
@@ -64,7 +66,11 @@ async fn main() -> anyhow::Result<()> {
                     let (kill_tx, kill_rx) = tokio::sync::oneshot::channel::<()>();
                     let cloned_interface = interface.clone();
                     let args = args.clone();
-                    let handle = tokio::spawn(attach_to_interface(args, cloned_interface.name.clone(), kill_rx));
+                    let handle = tokio::spawn(attach_to_interface(
+                        args,
+                        cloned_interface.name.clone(),
+                        kill_rx,
+                    ));
                     ebpf_tasks.insert(interface.name.clone(), (kill_tx, handle));
                 }
                 InterfaceUpdate::Removed { interface } => {
@@ -112,8 +118,11 @@ struct InterfaceMetrics<'a> {
     interface: &'a str,
     ingress: Counter,
     egress: Counter,
-    rx_bytes: u64,
-    tx_bytes: u64,
+}
+
+pub enum IngressImplementation {
+    Xdp,
+    Classifier,
 }
 
 async fn attach_to_interface(
@@ -122,13 +131,6 @@ async fn attach_to_interface(
     mut kill_rx: tokio::sync::oneshot::Receiver<()>,
 ) -> anyhow::Result<()> {
     log::info!("opening ebpf module for interface {iface}");
-
-    let rx_bytes = std::fs::read_to_string(format!("/sys/class/net/{iface}/statistics/rx_bytes"))
-        .map(|data| data.trim().parse::<u64>().unwrap_or(0))
-        .unwrap_or(0);
-    let tx_bytes = std::fs::read_to_string(format!("/sys/class/net/{iface}/statistics/tx_bytes"))
-        .map(|data| data.trim().parse::<u64>().unwrap_or(0))
-        .unwrap_or(0);
 
     let ebpf_program = aya::include_bytes_aligned!(concat!(env!("OUT_DIR"), "/snoopy"));
     let mut ebpf = aya::Ebpf::load(ebpf_program).with_context(|| "failed to load ebpf program")?;
@@ -139,20 +141,32 @@ async fn attach_to_interface(
 
     let _ = tc::qdisc_add_clsact(iface.as_str());
 
-    // let ingress_program: &mut SchedClassifier = ebpf
-    //     .program_mut("update_tc_ingress")
-    //     .expect("could not find program with name `update_tc_ingress`")
-    //     .try_into()?;
-    // ingress_program.load()?;
-    // ingress_program
-    //     .attach(iface.as_str(), TcAttachType::Ingress)
-    //     .context("failed to attach the TcAttachType::Ingress program")?;
+    let ingress_implementation = IngressImplementation::Xdp; // @lukas: manueller feature switch
 
-    let ingress_program: &mut Xdp = ebpf.program_mut("update_xdp_ingress").unwrap().try_into()?;
-    ingress_program.load()?;
-    ingress_program.attach(iface.as_str(), XdpFlags::default())
-            .context("failed to attach the XDP program with default flags - try changing XdpFlags::default() to XdpFlags::SKB_MODE")?;
+    match ingress_implementation {
+        IngressImplementation::Xdp => {
+            // ingress counter implementation using `XDP`
+            let ingress_program: &mut Xdp =
+                ebpf.program_mut("update_xdp_ingress").unwrap().try_into()?;
+            ingress_program.load()?;
+            ingress_program.attach(iface.as_str(), XdpFlags::default())
+                .context("failed to attach the XDP program with default flags - try changing XdpFlags::default() to XdpFlags::SKB_MODE")?;
+        },
+        IngressImplementation::Classifier => {
+            // ingress counter implementation using `Classifier` also known as `Tc`
+    
+            let ingress_program: &mut SchedClassifier = ebpf
+                .program_mut("update_tc_ingress")
+                .expect("could not find program with name `update_tc_ingress`")
+                .try_into()?;
+            ingress_program.load()?;
+            ingress_program
+                .attach(iface.as_str(), TcAttachType::Ingress)
+                .context("failed to attach the TcAttachType::Ingress program")?;
+        },
+    }
 
+    // egress counter implementation using `Classifier` also known as `Tc`
     let egress_program: &mut SchedClassifier = ebpf
         .program_mut("update_tc_egress")
         .expect("could not find program with name `update_tc_egress`")
@@ -165,8 +179,6 @@ async fn attach_to_interface(
     tokio::task::spawn(async move {
         let mut last_ingress_counter = Counter::default();
         let mut last_egress_counter = Counter::default();
-        let mut ingress_counter: Counter;
-        let mut egress_counter: Counter;
 
         let ingress_map: aya::maps::PerCpuArray<_, Counter> = aya::maps::PerCpuArray::try_from(
             ebpf.map("INGRESS_COUNTER")
@@ -180,39 +192,15 @@ async fn attach_to_interface(
         )
         .expect("failed to convert type of map");
 
-        let mut check_interval = tokio::time::interval(std::time::Duration::from_millis(args.metrics_rate));
+        let mut check_interval =
+            tokio::time::interval(std::time::Duration::from_millis(args.metrics_rate));
 
         loop {
             tokio::select! {
                 _ = &mut kill_rx => {
                     break;
                 }
-                _ = check_interval.tick() => {
-                    ingress_counter = Counter::default();
-                    for counter in ingress_map.iter().flatten() {
-                        ingress_counter = ingress_counter + *counter.first().unwrap();
-                    }
-        
-                    egress_counter = Counter::default();
-                    for counter in egress_map.iter().flatten() {
-                        egress_counter = egress_counter + *counter.first().unwrap();
-                    }
-        
-                    if last_egress_counter != egress_counter || last_ingress_counter != ingress_counter {
-                        let metrics = InterfaceMetrics {
-                            interface: iface.as_str(),
-                            ingress: ingress_counter,
-                            egress: egress_counter,
-                            rx_bytes,
-                            tx_bytes,
-                        };
-        
-                        println!("{}", serde_json::to_string(&metrics).unwrap());
-                    }
-        
-                    last_ingress_counter = ingress_counter;
-                    last_egress_counter = egress_counter;
-                }
+                _ = check_interval.tick() => handle_metrics_update(iface.as_str(), &mut last_ingress_counter, &mut last_egress_counter, &ingress_map, &egress_map)
             }
         }
 
@@ -220,6 +208,41 @@ async fn attach_to_interface(
     });
 
     Ok(())
+}
+
+fn handle_metrics_update(
+    iface: &str,
+    last_ingress_counter: &mut Counter,
+    last_egress_counter: &mut Counter,
+    ingress_map: &aya::maps::PerCpuArray<&aya::maps::MapData, Counter>,
+    egress_map: &aya::maps::PerCpuArray<&aya::maps::MapData, Counter>,
+) {
+    let mut ingress_counter = Counter::default();
+    for counter in ingress_map.get(&0, 0).unwrap().iter() {
+        ingress_counter = ingress_counter + *counter;
+    }
+
+    let mut egress_counter = Counter::default();
+    for counter in egress_map.get(&0, 0).unwrap().iter() {
+        egress_counter = egress_counter + *counter;
+    }
+
+    if *last_egress_counter != egress_counter || *last_ingress_counter != ingress_counter {
+        let metrics = InterfaceMetrics {
+            interface: iface,
+            ingress: ingress_counter,
+            egress: egress_counter,
+        };
+        println!("{}", serde_json::to_string(&metrics).unwrap());
+        eprintln!(
+            "{iface:?} UP {:?} DOWN {:?}",
+            human_bytes::human_bytes(ingress_counter.bytes as f64),
+            human_bytes::human_bytes(egress_counter.bytes as f64),
+        );
+    }
+
+    let _ = std::mem::replace(last_ingress_counter, ingress_counter);
+    let _ = std::mem::replace(last_egress_counter, egress_counter);
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -256,6 +279,7 @@ fn update_network_interfaces(
                 continue;
             }
         };
+
         if new_interface != previous_interface {
             updates.push(InterfaceUpdate::Changed {
                 previous: previous_interface.clone(),

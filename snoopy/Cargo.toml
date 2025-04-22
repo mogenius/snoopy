@@ -11,11 +11,11 @@ env_logger = { workspace = true, default-features = true }
 libc = { workspace = true }
 log = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
-pnet = { workspace = true, features = ["serde"] }
-serde = { workspace = true, features = ["derive"] }
-serde_json = { workspace = true }
-thiserror = { workspace = true }
 clap = { workspace = true, features = ["derive"] }
+pnet = { version = "0.35.0", features = ["serde"] }
+serde = { version = "1.0.219", features = ["derive"] }
+serde_json = "1.0.140"
+human_bytes = "0.4.3"
 
 [build-dependencies]
 anyhow = { workspace = true }

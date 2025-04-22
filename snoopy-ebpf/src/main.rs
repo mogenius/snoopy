@@ -6,8 +6,7 @@ use aya_ebpf::macros::map;
 use aya_ebpf::maps::PerCpuArray;
 use aya_ebpf::programs::TcContext;
 use aya_ebpf::programs::XdpContext;
-use aya_log_ebpf::debug;
-use aya_log_ebpf::error;
+use aya_log_ebpf::*;
 
 #[repr(C)]
 #[derive(Debug, Default, Copy, Clone, PartialEq, Eq)]
@@ -41,9 +40,7 @@ pub fn update_tc_ingress(ctx: TcContext) -> i32 {
 }
 
 pub fn try_update_tc_ingress(ctx: &TcContext) -> Result<(), &'static str> {
-    let data = ctx.data() as u64;
-    let data_end = ctx.data_end() as u64;
-    let bytes = data_end - data;
+    let bytes = ctx.len() as u64;
 
     let counter = INGRESS_COUNTER
         .get_ptr_mut(0)
@@ -78,7 +75,9 @@ pub fn update_xdp_ingress(ctx: XdpContext) -> u32 {
 fn try_update_xdp_ingress(ctx: &XdpContext) -> Result<(), &'static str> {
     let data = ctx.data() as u64;
     let data_end = ctx.data_end() as u64;
-    let bytes = data_end - data;
+    let metadata = ctx.metadata() as u64;
+    let metadata_end = ctx.metadata_end() as u64;
+    let bytes = (data_end - data) + (metadata_end - metadata);
 
     let counter = INGRESS_COUNTER
         .get_ptr_mut(0)
@@ -87,6 +86,8 @@ fn try_update_xdp_ingress(ctx: &XdpContext) -> Result<(), &'static str> {
     unsafe {
         (*counter).packets = (*counter).packets.wrapping_add(1);
         (*counter).bytes = (*counter).bytes.wrapping_add(bytes);
+
+        // info!(ctx, "XDP INGRESS: Packets: {}, Bytes: {}", (*counter).packets, (*counter).bytes);
     }
 
     Ok(())
