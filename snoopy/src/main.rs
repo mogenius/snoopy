@@ -1,5 +1,7 @@
 use std::collections::HashMap;
 use std::ops::Add;
+use std::str::FromStr;
+use std::io::Write;
 
 use anyhow::Context;
 use aya::Pod;
@@ -20,23 +22,55 @@ use serde::Serialize;
 #[command(version, about)]
 struct Arguments {
     #[arg(long, default_value = "100")]
+    /// Polling rate for updating the network devices list
     pub network_device_poll_rate: u64,
 
     #[arg(long, default_value = "500")]
+    /// Rate at which network metrics are collected from BPF modules and printed to stdout
     pub metrics_rate: u64,
+
+    #[arg(long, default_value = "xdp")]
+    /// BPF API to use for monitoring incoming traffic
+    ///
+    /// "classifier" => requires linux 4.1,
+    /// "xdp" => lower level and more performant than classifier but requires linux 4.8
+    pub ingress_implementation: IngressImplementation,
+
+    #[arg(long, default_value = "classifier")]
+    /// BPF API to use for monitoring outgoing traffic
+    ///
+    /// "classifier" => requires linux 4.1
+    pub egress_implementation: EgressImplementation,
 }
 
-#[tokio::main]
+#[tokio::main(worker_threads = 1)]
 async fn main() -> anyhow::Result<()> {
     if std::env::var("RUST_LOG").is_err() {
         unsafe {
             std::env::set_var("RUST_LOG", "info");
         }
     }
+    env_logger::builder()
+        .target(Target::Stderr)
+        .format(|buf, record| writeln!(
+            buf,
+            "{{\"level\": \"{}\", \"target\": \"{}\", \"message\":{}}}",
+            record.level(),
+            record.target(),
+            serde_json::to_string(&record.args().to_string()).unwrap()
+        ))
+        .init();
 
     let args = Arguments::parse();
 
-    env_logger::builder().target(Target::Stderr).init();
+    log::info!(
+        "Selected Ingress Implementation: {:?}",
+        args.ingress_implementation
+    );
+    log::info!(
+        "Selected Egress Implementation: {:?}",
+        args.egress_implementation
+    );
 
     // Bump the memlock rlimit. This is needed for older kernels that don't use the
     // new memcg based accounting, see https://lwn.net/Articles/837122/
@@ -74,7 +108,7 @@ async fn main() -> anyhow::Result<()> {
                     ebpf_tasks.insert(interface.name.clone(), (kill_tx, handle));
                 }
                 InterfaceUpdate::Removed { interface } => {
-                    log::info!("interface was removed: {}", interface);
+                    log::info!("interface was removed: {interface:?}");
                     if let Some((_, (kill_tx, handle))) =
                         ebpf_tasks.remove_entry(interface.name.as_str())
                     {
@@ -85,7 +119,7 @@ async fn main() -> anyhow::Result<()> {
                     }
                 }
                 InterfaceUpdate::Changed { previous, new } => {
-                    log::info!("interface changed: {} -> {}", previous, new);
+                    log::info!("interface changed: {previous:?} -> {new:?}");
                 }
             }
         }
@@ -120,9 +154,40 @@ struct InterfaceMetrics<'a> {
     egress: Counter,
 }
 
+#[derive(Debug, Default, Clone)]
 pub enum IngressImplementation {
-    Xdp,
+    #[default]
     Classifier,
+    Xdp,
+}
+
+impl FromStr for IngressImplementation {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "classifier" => Ok(IngressImplementation::Classifier),
+            "xdp" => Ok(IngressImplementation::Xdp),
+            _ => Err(anyhow::anyhow!("Invalid Ingress Implementation: {s}")),
+        }
+    }
+}
+
+#[derive(Debug, Default, Clone)]
+pub enum EgressImplementation {
+    #[default]
+    Classifier,
+}
+
+impl FromStr for EgressImplementation {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "classifier" => Ok(EgressImplementation::Classifier),
+            _ => Err(anyhow::anyhow!("Invalid Egress Implementation: {s}")),
+        }
+    }
 }
 
 async fn attach_to_interface(
@@ -141,9 +206,7 @@ async fn attach_to_interface(
 
     let _ = tc::qdisc_add_clsact(iface.as_str());
 
-    let ingress_implementation = IngressImplementation::Xdp; // @lukas: manueller feature switch
-
-    match ingress_implementation {
+    match args.ingress_implementation {
         IngressImplementation::Xdp => {
             // ingress counter implementation using `XDP`
             let ingress_program: &mut Xdp =
@@ -151,10 +214,10 @@ async fn attach_to_interface(
             ingress_program.load()?;
             ingress_program.attach(iface.as_str(), XdpFlags::default())
                 .context("failed to attach the XDP program with default flags - try changing XdpFlags::default() to XdpFlags::SKB_MODE")?;
-        },
+        }
         IngressImplementation::Classifier => {
             // ingress counter implementation using `Classifier` also known as `Tc`
-    
+
             let ingress_program: &mut SchedClassifier = ebpf
                 .program_mut("update_tc_ingress")
                 .expect("could not find program with name `update_tc_ingress`")
@@ -163,18 +226,22 @@ async fn attach_to_interface(
             ingress_program
                 .attach(iface.as_str(), TcAttachType::Ingress)
                 .context("failed to attach the TcAttachType::Ingress program")?;
-        },
+        }
     }
 
-    // egress counter implementation using `Classifier` also known as `Tc`
-    let egress_program: &mut SchedClassifier = ebpf
-        .program_mut("update_tc_egress")
-        .expect("could not find program with name `update_tc_egress`")
-        .try_into()?;
-    egress_program.load()?;
-    egress_program
-        .attach(iface.as_str(), TcAttachType::Egress)
-        .context("failed to attach the TcAttachType::Egress program")?;
+    match args.egress_implementation {
+        EgressImplementation::Classifier => {
+            // egress counter implementation using `Classifier` also known as `Tc`
+            let egress_program: &mut SchedClassifier = ebpf
+                .program_mut("update_tc_egress")
+                .expect("could not find program with name `update_tc_egress`")
+                .try_into()?;
+            egress_program.load()?;
+            egress_program
+                .attach(iface.as_str(), TcAttachType::Egress)
+                .context("failed to attach the TcAttachType::Egress program")?;
+        }
+    }
 
     tokio::task::spawn(async move {
         let mut last_ingress_counter = Counter::default();
@@ -234,11 +301,11 @@ fn handle_metrics_update(
             egress: egress_counter,
         };
         println!("{}", serde_json::to_string(&metrics).unwrap());
-        eprintln!(
-            "{iface:?} UP {:?} DOWN {:?}",
-            human_bytes::human_bytes(ingress_counter.bytes as f64),
-            human_bytes::human_bytes(egress_counter.bytes as f64),
-        );
+        // eprintln!(
+        //     "{iface:?} DOWNLOAD({:?}) UPLOAD({:?})",
+        //     human_bytes::human_bytes(ingress_counter.bytes as f64),
+        //     human_bytes::human_bytes(egress_counter.bytes as f64),
+        // );
     }
 
     let _ = std::mem::replace(last_ingress_counter, ingress_counter);
