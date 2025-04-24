@@ -1,0 +1,49 @@
+name: Build and Push
+on:
+  push:
+    branches:
+      - master
+
+env:
+  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+jobs:
+  release:
+    runs-on: MEGA-FAST # ubuntu-latest
+    steps:
+    - name: Checkout Repository
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+
+    - name: Semantic Release
+      id: semantic_release
+      uses: cycjimmy/semantic-release-action@v4
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    
+    - name: Build the Docker image
+      run: docker build -t snoppy:latest .
+    
+    - name: Create output directory for binaries
+      run: mkdir -p output
+    
+    - name: Extract binaries from Docker image
+      run: |
+        container_id=$(docker create snoppy:latest)
+        docker cp $container_id:/usr/local/bin/x86_64-snoopy ./output/x86_64-snoopy
+        docker cp $container_id:/usr/local/bin/aarch64-snoopy ./output/aarch64-snoopy
+        docker cp $container_id:/usr/local/bin/riscv64-snoopy ./output/riscv64-snoopy
+        docker cp $container_id:/usr/local/bin/powerpc64le-snoopy ./output/powerpc64le-snoopy
+        docker cp $container_id:/usr/local/bin/armv7-snoopy ./output/armv7-snoopy
+        docker rm $container_id
+    
+    - name: Release
+      uses: softprops/action-gh-release@v2
+      with:
+        tag_name: ${{ steps.semantic_release.outputs.new_release_version }}
+        files: |
+          ./output/x86_64-snoopy
+          ./output/aarch64-snoopy
+          ./output/riscv64-snoopy
+          ./output/powerpc64le-snoopy
+          ./output/armv7-snoopy

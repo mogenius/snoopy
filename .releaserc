@@ -1,0 +1,21 @@
+{
+    "repositoryUrl": "https://github.com/mogenius/snoopy.git",
+    "branches": [
+        "master",
+        {
+            "name": "develop",
+            "prerelease": true
+        }
+    ],
+    "plugins": [
+        "@semantic-release/commit-analyzer",
+        [
+            "@semantic-release/github",
+            {
+                "successComment": false,
+                "failTitle": false
+            }
+        ],
+        "@semantic-release/release-notes-generator"
+    ]
+}

@@ -9,7 +9,6 @@ use aya::programs::SchedClassifier;
 use aya::programs::TcAttachType;
 use aya::programs::Xdp;
 use aya::programs::XdpFlags;
-use aya::programs::tc;
 use clap::Parser;
 use env_logger::Target;
 use pnet::datalink::NetworkInterface;
@@ -80,7 +79,7 @@ async fn main() -> anyhow::Result<()> {
     };
     let ret = unsafe { libc::setrlimit(libc::RLIMIT_MEMLOCK, &rlim) };
     if ret != 0 {
-        log::debug!("remove limit on locked memory failed, ret is: {}", ret);
+        return Err(anyhow::anyhow!("remove limit on locked memory failed, ret is: {}", ret));
     }
 
     let mut interface_update_interval = tokio::time::interval(std::time::Duration::from_millis(
@@ -204,7 +203,8 @@ async fn attach_to_interface(
         log::warn!("failed to initialize eBPF logger: {error}");
     }
 
-    let _ = tc::qdisc_add_clsact(iface.as_str());
+    // TODO: this causes deadlocks; why? and according to docs it should be required for the program to work but it appears to work fine without
+    // aya::programs::tc::qdisc_add_clsact(iface.as_str())?;
 
     match args.ingress_implementation {
         IngressImplementation::Xdp => {
