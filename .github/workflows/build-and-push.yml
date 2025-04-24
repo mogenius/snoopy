@@ -8,12 +8,10 @@ env:
   GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 jobs:
   release:
-    runs-on: MEGA-FAST # ubuntu-latest
+    runs-on: MEGA-FAST
     steps:
     - name: Checkout Repository
       uses: actions/checkout@v4
-      with:
-        fetch-depth: 0
 
     - name: Semantic Release
       id: semantic_release
@@ -42,8 +40,4 @@ jobs:
       with:
         tag_name: ${{ steps.semantic_release.outputs.new_release_version }}
         files: |
-          ./output/x86_64-snoopy
-          ./output/aarch64-snoopy
-          ./output/riscv64-snoopy
-          ./output/powerpc64le-snoopy
-          ./output/armv7-snoopy
+          ./output/*
