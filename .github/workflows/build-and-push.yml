@@ -28,11 +28,11 @@ jobs:
     - name: Extract binaries from Docker image
       run: |
         container_id=$(docker create snoppy:latest)
-        docker cp $container_id:/usr/local/bin/snoopy_x86_64-unknown-linux-musl ./output/snoopy_x86_64-unknown-linux-musl
-        docker cp $container_id:/usr/local/bin/snoopy_aarch64-unknown-linux-musl ./output/snoopy_aarch64-unknown-linux-musl
-        docker cp $container_id:/usr/local/bin/snoopy_riscv64-unknown-linux-musl ./output/snoopy_riscv64-unknown-linux-musl
-        docker cp $container_id:/usr/local/bin/snoopy_powerpc64le-unknown-linux-musl ./output/snoopy_powerpc64le-unknown-linux-musl
-        docker cp $container_id:/usr/local/bin/snoopy_armv7-unknown-linux-musleabi ./output/snoopy_armv7-unknown-linux-musleabi
+        docker cp $container_id:/usr/local/bin/snoopy_x86_64-unknown-linux-musl ./output/snoopy_x86_64
+        docker cp $container_id:/usr/local/bin/snoopy_aarch64-unknown-linux-musl ./output/snoopy_aarch64
+        docker cp $container_id:/usr/local/bin/snoopy_riscv64-unknown-linux-musl ./output/snoopy_riscv64
+        docker cp $container_id:/usr/local/bin/snoopy_powerpc64le-unknown-linux-musl ./output/snoopy_powerpc64le
+        docker cp $container_id:/usr/local/bin/snoopy_armv7-unknown-linux-musleabi ./output/snoopy_armv7
         docker rm $container_id
     
     - name: Release
