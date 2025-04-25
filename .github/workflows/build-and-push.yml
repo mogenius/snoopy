@@ -37,8 +37,8 @@ jobs:
     
     - name: Release
       uses: softprops/action-gh-release@v2
+      if: ${{ steps.semantic_release.outputs.new_release_published }} # only run if a new release is published
       with:
-        if: ${{ steps.semantic_release.outputs.new_release_published }} # only run if a new release is published
         tag_name: v${{ steps.semantic_release.outputs.new_release_version }}
         files: |
           ./output/*
