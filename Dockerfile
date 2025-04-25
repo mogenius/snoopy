@@ -64,22 +64,22 @@ RUN export ARCH="$(uname -m)" && \
     cargo zigbuild --package "snoopy" --release --target="powerpc64le-unknown-linux-musl" && \
     mkdir "dist" && \
     # cp "target/${ARCH}-unknown-linux-musl/release/snoopy" "/usr/local/bin/snoopy"
-    cp "target/x86_64-unknown-linux-musl/release/snoopy" "/usr/local/bin/x86_64-snoopy" && \
-    cp "target/aarch64-unknown-linux-musl/release/snoopy" "/usr/local/bin/aarch64-snoopy" && \
-    cp "target/riscv64gc-unknown-linux-musl/release/snoopy" "/usr/local/bin/riscv64-snoopy" && \
-    cp "target/powerpc64le-unknown-linux-musl/release/snoopy" "/usr/local/bin/powerpc64le-snoopy" && \
-    cp "target/armv7-unknown-linux-musleabi/release/snoopy" "/usr/local/bin/armv7-snoopy"
+    cp "target/x86_64-unknown-linux-musl/release/snoopy" "/usr/local/bin/snoopy_x86_64-unknown-linux-musl" && \
+    cp "target/aarch64-unknown-linux-musl/release/snoopy" "/usr/local/bin/snoopy_aarch64-unknown-linux-musl" && \
+    cp "target/riscv64gc-unknown-linux-musl/release/snoopy" "/usr/local/bin/snoopy_riscv64-unknown-linux-musl" && \
+    cp "target/powerpc64le-unknown-linux-musl/release/snoopy" "/usr/local/bin/snoopy_powerpc64le-unknown-linux-musl" && \
+    cp "target/armv7-unknown-linux-musleabi/release/snoopy" "/usr/local/bin/snoopy_armv7-unknown-linux-musleabi"
 
 FROM docker.io/library/alpine:3.21.0
 
 # COPY --from=snoopy "/usr/local/bin/snoopy" "/usr/local/bin/snoopy"
-COPY --from=snoopy "/usr/local/bin/x86_64-snoopy" "/usr/local/bin/x86_64-snoopy"
-COPY --from=snoopy "/usr/local/bin/aarch64-snoopy" "/usr/local/bin/aarch64-snoopy"
-COPY --from=snoopy "/usr/local/bin/armv7-snoopy" "/usr/local/bin/armv7-snoopy"
-COPY --from=snoopy "/usr/local/bin/riscv64-snoopy" "/usr/local/bin/riscv64-snoopy"
-COPY --from=snoopy "/usr/local/bin/powerpc64le-snoopy" "/usr/local/bin/powerpc64le-snoopy"
+COPY --from=snoopy "/usr/local/bin/snoopy_x86_64-unknown-linux-musl" "/usr/local/bin/snoopy_x86_64-unknown-linux-musl"
+COPY --from=snoopy "/usr/local/bin/snoopy_aarch64-unknown-linux-musl" "/usr/local/bin/snoopy_aarch64-unknown-linux-musl"
+COPY --from=snoopy "/usr/local/bin/snoopy_armv7-unknown-linux-musleabi" "/usr/local/bin/snoopy_armv7-unknown-linux-musleabi"
+COPY --from=snoopy "/usr/local/bin/snoopy_riscv64-unknown-linux-musl" "/usr/local/bin/snoopy_riscv64-unknown-linux-musl"
+COPY --from=snoopy "/usr/local/bin/snoopy_powerpc64le-unknown-linux-musl" "/usr/local/bin/snoopy_powerpc64le-unknown-linux-musl"
 
 RUN apk add --no-cache "dumb-init" && ls -lah "/usr/local/bin/"
 
 ENTRYPOINT [ "dumb-init", "--" ]
-CMD [ "x86_64-snoopy" ]
+CMD [ "snoopy_x86_64-unknown-linux-musl" ]
