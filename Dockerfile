@@ -49,6 +49,11 @@ FROM builder AS snoopy
 COPY . /app
 WORKDIR /app
 
+RUN cargo install cargo-set-version
+
+RUN VERSION=$(git describe --tags $(git rev-list --tags --max-count=1) | sed 's/^v//') && \
+    cargo-set-version ${VERSION}
+
 RUN export ARCH="$(uname -m)" && \
     case "${ARCH}" in \
         x86_64) ;; \
