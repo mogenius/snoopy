@@ -42,7 +42,7 @@ struct Arguments {
     pub egress_implementation: EgressImplementation,
 }
 
-#[tokio::main(worker_threads = 1)]
+#[tokio::main(worker_threads = 4)]
 async fn main() -> anyhow::Result<()> {
     if std::env::var("RUST_LOG").is_err() {
         unsafe {
@@ -92,10 +92,10 @@ async fn main() -> anyhow::Result<()> {
         interface_update_interval.tick().await;
         let network_interface_updates = update_network_interfaces(&mut network_interfaces);
         for event in network_interface_updates.iter() {
-            log::info!("received event: {}", serde_json::to_string(&event).unwrap());
+            println!("{}", serde_json::to_string(&event).unwrap());
 
             match event {
-                InterfaceUpdate::Added { interface } => {
+                InterfaceUpdate::InterfaceAdded { interface } => {
                     let (kill_tx, kill_rx) = tokio::sync::oneshot::channel::<()>();
                     let cloned_interface = interface.clone();
                     let args = args.clone();
@@ -106,7 +106,7 @@ async fn main() -> anyhow::Result<()> {
                     ));
                     ebpf_tasks.insert(interface.name.clone(), (kill_tx, handle));
                 }
-                InterfaceUpdate::Removed { interface } => {
+                InterfaceUpdate::InterfaceRemoved { interface } => {
                     log::info!("interface was removed: {interface:?}");
                     if let Some((_, (kill_tx, handle))) =
                         ebpf_tasks.remove_entry(interface.name.as_str())
@@ -117,7 +117,7 @@ async fn main() -> anyhow::Result<()> {
                         }
                     }
                 }
-                InterfaceUpdate::Changed { previous, new } => {
+                InterfaceUpdate::InterfaceChanged { previous, new } => {
                     log::info!("interface changed: {previous:?} -> {new:?}");
                 }
             }
@@ -315,13 +315,13 @@ fn handle_metrics_update(
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(tag = "type")]
 pub enum InterfaceUpdate {
-    Added {
+    InterfaceAdded {
         interface: NetworkInterface,
     },
-    Removed {
+    InterfaceRemoved {
         interface: NetworkInterface,
     },
-    Changed {
+    InterfaceChanged {
         previous: NetworkInterface,
         new: NetworkInterface,
     },
@@ -340,7 +340,7 @@ fn update_network_interfaces(
         let previous_interface = match previous_interface {
             Some(previous_interface) => previous_interface,
             None => {
-                updates.push(InterfaceUpdate::Added {
+                updates.push(InterfaceUpdate::InterfaceAdded {
                     interface: new_interface.clone(),
                 });
                 continue;
@@ -348,7 +348,7 @@ fn update_network_interfaces(
         };
 
         if new_interface != previous_interface {
-            updates.push(InterfaceUpdate::Changed {
+            updates.push(InterfaceUpdate::InterfaceChanged {
                 previous: previous_interface.clone(),
                 new: new_interface.clone(),
             });
@@ -360,7 +360,7 @@ fn update_network_interfaces(
             .iter()
             .any(|interface| previous_interface.name == interface.name)
         {
-            updates.push(InterfaceUpdate::Removed {
+            updates.push(InterfaceUpdate::InterfaceRemoved {
                 interface: previous_interface.clone(),
             });
         }
