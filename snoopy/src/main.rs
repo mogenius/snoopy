@@ -28,7 +28,7 @@ struct Arguments {
     /// Rate at which network metrics are collected from BPF modules and printed to stdout
     pub metrics_rate: u64,
 
-    #[arg(long, default_value = "classifier")]
+    #[arg(long, default_value = "xdp")]
     /// BPF API to use for monitoring incoming traffic
     ///
     /// "classifier" => requires linux 4.1,
@@ -203,7 +203,9 @@ async fn attach_to_interface(
         log::warn!("failed to initialize eBPF logger: {error}");
     }
 
-    aya::programs::tc::qdisc_add_clsact(iface.as_str())?;
+    // REMARK: BENE THIS REALY CAUSES DEADLOCKS. I REMOVED IT AGAIN: DONT ADD IT BACK UNLESS YOU KNOW WHAT YOU ARE DOING
+    // TODO: this causes deadlocks; why? and according to docs it should be required for the program to work but it appears to work fine without
+    // aya::programs::tc::qdisc_add_clsact(iface.as_str())?;
 
     match args.ingress_implementation {
         IngressImplementation::Xdp => {
