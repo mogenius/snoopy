@@ -203,8 +203,7 @@ async fn attach_to_interface(
         log::warn!("failed to initialize eBPF logger: {error}");
     }
 
-    // TODO: this causes deadlocks; why? and according to docs it should be required for the program to work but it appears to work fine without
-    // aya::programs::tc::qdisc_add_clsact(iface.as_str())?;
+    aya::programs::tc::qdisc_add_clsact(iface.as_str())?;
 
     match args.ingress_implementation {
         IngressImplementation::Xdp => {
