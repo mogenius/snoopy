@@ -28,7 +28,7 @@ struct Arguments {
     /// Rate at which network metrics are collected from BPF modules and printed to stdout
     pub metrics_rate: u64,
 
-    #[arg(long, default_value = "xdp")]
+    #[arg(long, default_value = "classifier")]
     /// BPF API to use for monitoring incoming traffic
     ///
     /// "classifier" => requires linux 4.1,
