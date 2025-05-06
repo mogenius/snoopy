@@ -1,9 +1,9 @@
-use std::collections::HashMap;
+use std::{collections::HashMap, path::Path};
 use std::ops::Add;
 use std::str::FromStr;
 use std::io::Write;
 
-use anyhow::Context;
+use anyhow::{anyhow, Context};
 use aya::Pod;
 use aya::programs::SchedClassifier;
 use aya::programs::TcAttachType;
@@ -70,6 +70,10 @@ async fn main() -> anyhow::Result<()> {
         "Selected Egress Implementation: {:?}",
         args.egress_implementation
     );
+
+    if !Path::new("/sys/kernel/btf").exists() {
+        return Err(anyhow!("This Kernel does not support BTF"));
+    }
 
     // Bump the memlock rlimit. This is needed for older kernels that don't use the
     // new memcg based accounting, see https://lwn.net/Articles/837122/
