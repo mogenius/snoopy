@@ -18,13 +18,13 @@ jobs:
       uses: cycjimmy/semantic-release-action@v4
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-    
+
     - name: Build the Docker image
-      run: docker build -t snoppy:latest .
-    
+      run: docker build --pull -t snoppy:latest .
+
     - name: Create output directory for binaries
       run: mkdir -p output
-    
+
     - name: Extract binaries from Docker image
       run: |
         container_id=$(docker create snoppy:latest)
@@ -34,7 +34,7 @@ jobs:
         docker cp $container_id:/usr/local/bin/snoopy_powerpc64le-unknown-linux-musl ./output/snoopy_powerpc64le
         docker cp $container_id:/usr/local/bin/snoopy_armv7-unknown-linux-musleabi ./output/snoopy_armv7
         docker rm $container_id
-    
+
     - name: Release
       uses: softprops/action-gh-release@v2
       if: ${{ steps.semantic_release.outputs.new_release_published }} # only run if a new release is published

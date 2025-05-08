@@ -32,7 +32,6 @@ COPY --from=bpf-linker "/usr/local/cargo/bin/bpf-linker" "/usr/local/bin/bpf-lin
 RUN export ARCH="$(uname -m)" && \
     case "${ARCH}" in \
         x86_64) ;; \
-        aarch64) ;; \
         *) printf "Unsupported architecture: %s\n" "${ARCH}"; exit 1 ;; \
     esac && \
     set -eux && \
