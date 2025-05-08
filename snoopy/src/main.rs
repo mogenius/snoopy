@@ -42,7 +42,7 @@ struct Arguments {
     pub egress_implementation: EgressImplementation,
 }
 
-#[tokio::main(worker_threads = 4)]
+#[tokio::main(worker_threads = 2)]
 async fn main() -> anyhow::Result<()> {
     if std::env::var("RUST_LOG").is_err() {
         unsafe {
