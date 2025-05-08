@@ -1,9 +1,11 @@
-use std::{collections::HashMap, path::Path};
-use std::ops::Add;
-use std::str::FromStr;
+use std::collections::HashMap;
 use std::io::Write;
+use std::ops::Add;
+use std::path::Path;
+use std::str::FromStr;
 
-use anyhow::{anyhow, Context};
+use anyhow::Context;
+use anyhow::anyhow;
 use aya::Pod;
 use aya::programs::SchedClassifier;
 use aya::programs::TcAttachType;
@@ -51,13 +53,15 @@ async fn main() -> anyhow::Result<()> {
     }
     env_logger::builder()
         .target(Target::Stderr)
-        .format(|buf, record| writeln!(
-            buf,
-            "{{\"level\": \"{}\", \"target\": \"{}\", \"message\":{}}}",
-            record.level(),
-            record.target(),
-            serde_json::to_string(&record.args().to_string()).unwrap()
-        ))
+        .format(|buf, record| {
+            writeln!(
+                buf,
+                "{{\"level\": \"{}\", \"target\": \"{}\", \"message\":{}}}",
+                record.level(),
+                record.target(),
+                serde_json::to_string(&record.args().to_string()).unwrap()
+            )
+        })
         .init();
 
     let args = Arguments::parse();
@@ -83,7 +87,10 @@ async fn main() -> anyhow::Result<()> {
     };
     let ret = unsafe { libc::setrlimit(libc::RLIMIT_MEMLOCK, &rlim) };
     if ret != 0 {
-        return Err(anyhow::anyhow!("remove limit on locked memory failed, ret is: {}", ret));
+        return Err(anyhow::anyhow!(
+            "remove limit on locked memory failed, ret is: {}",
+            ret
+        ));
     }
 
     let mut interface_update_interval = tokio::time::interval(std::time::Duration::from_millis(
