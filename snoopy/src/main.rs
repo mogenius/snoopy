@@ -86,15 +86,23 @@ async fn main() -> anyhow::Result<()> {
             match event {
                 InterfaceUpdate::InterfaceAdded { interface } => {
                     let (kill_tx, kill_rx) = tokio::sync::oneshot::channel::<()>();
-                    let cloned_interface = interface.clone();
                     let args = args.clone();
-                    let handle = tokio::spawn(async move {
-                        let interface_name = cloned_interface.name.as_str();
-                        if let Err(error) = attach_to_interface(args, cloned_interface.name.clone(), kill_rx).await {
-                            log::error!("task for {interface_name} finished with an error: {error}");
+                    match initialize_ebpf_for_interface(interface.name.clone()).await {
+                        Ok((ebpf, ingress_impl, egress_impl)) => {
+                            let handle = tokio::spawn(attach_to_interface(
+                                args,
+                                interface.name.clone(),
+                                ebpf,
+                                ingress_impl,
+                                egress_impl,
+                                kill_rx,
+                            ));
+                            ebpf_tasks.insert(interface.name.clone(), (kill_tx, handle));
                         }
-                    });
-                    ebpf_tasks.insert(interface.name.clone(), (kill_tx, handle));
+                        Err(error) => {
+                            log::error!("failed to initialize ebpf module for {interface}: {error}")
+                        }
+                    }
                 }
                 InterfaceUpdate::InterfaceRemoved { interface } => {
                     log::info!("interface was removed: {interface:?}");
@@ -185,13 +193,12 @@ impl FromStr for EgressImplementation {
     }
 }
 
-async fn attach_to_interface(
-    args: Arguments,
+async fn initialize_ebpf_for_interface(
     iface: String,
-    mut kill_rx: tokio::sync::oneshot::Receiver<()>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<(aya::Ebpf, IngressImplementation, EgressImplementation)> {
     let ebpf_program = aya::include_bytes_aligned!(concat!(env!("OUT_DIR"), "/snoopy"));
     let mut ebpf = aya::Ebpf::load(ebpf_program).with_context(|| "failed to load ebpf program")?;
+
     if let Err(error) = aya_log::EbpfLogger::init_with_logger(&mut ebpf, log::logger()) {
         // This can happen if you remove all log statements from your eBPF program.
         log::warn!("failed to initialize eBPF logger: {error}");
@@ -199,88 +206,85 @@ async fn attach_to_interface(
 
     if let Err(error) = aya::programs::tc::qdisc_add_clsact(iface.as_str()) {
         match error.kind() {
-            std::io::ErrorKind::AlreadyExists => {},
-            _ => log::warn!("failed to call aya::programs::tc::qdisc_add_clsact on {iface:?}: {error}")
+            std::io::ErrorKind::AlreadyExists => {}
+            _ => log::warn!(
+                "failed to call aya::programs::tc::qdisc_add_clsact on {iface:?}: {error}"
+            ),
         }
     }
 
-    let mut ingress_impl = IngressImplementation::None;
-    match attach_ingress_xdp_counter(&mut ebpf, iface.as_str()) {
-        Ok(_) => {
-            ingress_impl = IngressImplementation::Xdp;
-            log::info!("attached ingress xdp on {iface}");
-        },
-        Err(error) => {
-            log::info!("failed to attach ingress xdp on {iface}: {error}");
-            match attach_ingress_classifier_counter(&mut ebpf, iface.as_str()) {
-                Ok(_) => {
-                    ingress_impl = IngressImplementation::Classifier;
-                    log::info!("attached ingress classifier on {iface}");
-                },
-                Err(error) => {
-                    log::info!("failed to attach ingress classifier on {iface}: {error}");
-                },
+    let ingress_impl = attach_ingress_counter(&mut ebpf, iface.as_str());
+    let egress_impl = attach_egress_counter(&mut ebpf, iface.as_str());
+
+    Ok((ebpf, ingress_impl, egress_impl))
+}
+
+async fn attach_to_interface(
+    args: Arguments,
+    iface: String,
+    ebpf: aya::Ebpf,
+    ingress_impl: IngressImplementation,
+    egress_impl: EgressImplementation,
+    mut kill_rx: tokio::sync::oneshot::Receiver<()>,
+) {
+    let mut last_ingress_counter = Counter::default();
+    let mut last_egress_counter = Counter::default();
+
+    let ingress_map: aya::maps::PerCpuArray<_, Counter> = aya::maps::PerCpuArray::try_from(
+        ebpf.map("INGRESS_COUNTER")
+            .expect("could not find map with name `INGRESS_COUNTER`"),
+    )
+    .expect("failed to convert type of map");
+
+    let egress_map: aya::maps::PerCpuArray<_, Counter> = aya::maps::PerCpuArray::try_from(
+        ebpf.map("EGRESS_COUNTER")
+            .expect("could not find map with name `EGRESS_COUNTER`"),
+    )
+    .expect("failed to convert type of map");
+
+    let mut check_interval =
+        tokio::time::interval(std::time::Duration::from_millis(args.metrics_rate));
+
+    loop {
+        tokio::select! {
+            _ = &mut kill_rx => {
+                break;
             }
-        },
-    }
-
-    let mut egress_impl = EgressImplementation::None;
-    match attach_egress_classifier_counter(&mut ebpf, iface.as_str()) {
-        Ok(_) => {
-            egress_impl = EgressImplementation::Classifier;
-            log::info!("attached egress classifier on {iface}");
-        },
-        Err(error) => log::info!("failed to attach egress classifier on {iface}: {error}"),
-    }
-
-    tokio::task::spawn(async move {
-        let mut last_ingress_counter = Counter::default();
-        let mut last_egress_counter = Counter::default();
-
-        let ingress_map: aya::maps::PerCpuArray<_, Counter> = aya::maps::PerCpuArray::try_from(
-            ebpf.map("INGRESS_COUNTER")
-                .expect("could not find map with name `INGRESS_COUNTER`"),
-        )
-        .expect("failed to convert type of map");
-
-        let egress_map: aya::maps::PerCpuArray<_, Counter> = aya::maps::PerCpuArray::try_from(
-            ebpf.map("EGRESS_COUNTER")
-                .expect("could not find map with name `EGRESS_COUNTER`"),
-        )
-        .expect("failed to convert type of map");
-
-        let mut check_interval =
-            tokio::time::interval(std::time::Duration::from_millis(args.metrics_rate));
-
-        loop {
-            tokio::select! {
-                _ = &mut kill_rx => {
-                    break;
-                }
-                _ = check_interval.tick() => handle_metrics_update(
-                    iface.as_str(),
-                    ingress_impl,
-                    egress_impl,
-                    &mut last_ingress_counter,
-                    &mut last_egress_counter,
-                    &ingress_map,
-                    &egress_map
-                )
-            }
+            _ = check_interval.tick() => handle_metrics_update(
+                iface.as_str(),
+                ingress_impl,
+                egress_impl,
+                &mut last_ingress_counter,
+                &mut last_egress_counter,
+                &ingress_map,
+                &egress_map
+            )
         }
+    }
 
-        log::info!("closed ebpf module for interface {iface}");
-    });
+    log::info!("closed ebpf module for interface {iface}");
+}
 
-    Ok(())
+/// Attempt to attach any of the available implementations for counting ingress traffic
+/// and returns the chosen implementation.
+fn attach_ingress_counter(ebpf: &mut aya::Ebpf, iface: &str) -> IngressImplementation {
+    if attach_ingress_xdp_counter(ebpf, iface).is_ok() {
+        return IngressImplementation::Xdp;
+    }
+
+    if attach_ingress_classifier_counter(ebpf, iface).is_ok() {
+        return IngressImplementation::Classifier;
+    }
+
+    IngressImplementation::None
 }
 
 /// ingress counter implementation using `XDP`
 fn attach_ingress_xdp_counter(ebpf: &mut aya::Ebpf, iface: &str) -> anyhow::Result<()> {
-    let ingress_program: &mut Xdp =
-        ebpf.program_mut("update_xdp_ingress").unwrap().try_into()?;
+    let ingress_program: &mut Xdp = ebpf.program_mut("update_xdp_ingress").unwrap().try_into()?;
     ingress_program.load()?;
-    ingress_program.attach(iface, XdpFlags::default())
+    ingress_program
+        .attach(iface, XdpFlags::default())
         .map_err(|err| anyhow!("failed to attach the XDP program with default flags: {err}"))?;
 
     Ok(())
@@ -298,6 +302,16 @@ fn attach_ingress_classifier_counter(ebpf: &mut aya::Ebpf, iface: &str) -> anyho
         .map_err(|err| anyhow!("failed to attach the TcAttachType::Ingress program: {err}"))?;
 
     Ok(())
+}
+
+/// Attempt to attach any of the available implementations for counting egress traffic
+/// and returns the chosen implementation.
+fn attach_egress_counter(ebpf: &mut aya::Ebpf, iface: &str) -> EgressImplementation {
+    if attach_egress_classifier_counter(ebpf, iface).is_ok() {
+        return EgressImplementation::Classifier;
+    }
+
+    EgressImplementation::None
 }
 
 /// egress counter implementation using `Classifier` also known as `Tc`
