@@ -89,12 +89,19 @@ async fn main() -> anyhow::Result<()> {
                     let args = args.clone();
                     match initialize_ebpf_for_interface(interface.name.clone()).await {
                         Ok((ebpf, ingress_impl, egress_impl)) => {
+                            println!(
+                                "{}",
+                                serde_json::to_string(&InterfaceBpfInitialized {
+                                    interface: interface.name.as_str(),
+                                    ingress_implementation: ingress_impl,
+                                    egress_implementation: egress_impl,
+                                })
+                                .unwrap()
+                            );
                             let handle = tokio::spawn(attach_to_interface(
                                 args,
                                 interface.name.clone(),
                                 ebpf,
-                                ingress_impl,
-                                egress_impl,
                                 kill_rx,
                             ));
                             ebpf_tasks.insert(interface.name.clone(), (kill_tx, handle));
@@ -145,10 +152,16 @@ impl Add for Counter {
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type")]
-struct InterfaceMetrics<'a> {
+struct InterfaceBpfInitialized<'a> {
     interface: &'a str,
     ingress_implementation: IngressImplementation,
     egress_implementation: EgressImplementation,
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type")]
+struct InterfaceMetrics<'a> {
+    interface: &'a str,
     ingress: Counter,
     egress: Counter,
 }
@@ -223,8 +236,6 @@ async fn attach_to_interface(
     args: Arguments,
     iface: String,
     ebpf: aya::Ebpf,
-    ingress_impl: IngressImplementation,
-    egress_impl: EgressImplementation,
     mut kill_rx: tokio::sync::oneshot::Receiver<()>,
 ) {
     let mut last_ingress_counter = Counter::default();
@@ -252,8 +263,6 @@ async fn attach_to_interface(
             }
             _ = check_interval.tick() => handle_metrics_update(
                 iface.as_str(),
-                ingress_impl,
-                egress_impl,
                 &mut last_ingress_counter,
                 &mut last_egress_counter,
                 &ingress_map,
@@ -330,8 +339,6 @@ fn attach_egress_classifier_counter(ebpf: &mut aya::Ebpf, iface: &str) -> anyhow
 
 fn handle_metrics_update(
     iface: &str,
-    ingress_implementation: IngressImplementation,
-    egress_implementation: EgressImplementation,
     last_ingress_counter: &mut Counter,
     last_egress_counter: &mut Counter,
     ingress_map: &aya::maps::PerCpuArray<&aya::maps::MapData, Counter>,
@@ -350,8 +357,6 @@ fn handle_metrics_update(
     if *last_egress_counter != egress_counter || *last_ingress_counter != ingress_counter {
         let metrics = InterfaceMetrics {
             interface: iface,
-            ingress_implementation,
-            egress_implementation,
             ingress: ingress_counter,
             egress: egress_counter,
         };
