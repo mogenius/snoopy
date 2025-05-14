@@ -217,14 +217,16 @@ async fn initialize_ebpf_for_interface(
         log::warn!("failed to initialize eBPF logger: {error}");
     }
 
-    if let Err(error) = aya::programs::tc::qdisc_add_clsact(iface.as_str()) {
-        match error.kind() {
-            std::io::ErrorKind::AlreadyExists => {}
-            _ => log::warn!(
-                "failed to call aya::programs::tc::qdisc_add_clsact on {iface:?}: {error}"
-            ),
-        }
-    }
+    // REMARK: BENE THIS REALY CAUSES DEADLOCKS. I REMOVED IT AGAIN: DONT ADD IT BACK UNLESS YOU KNOW WHAT YOU ARE DOING
+    // TODO: this causes deadlocks; why? and according to docs it should be required for the program to work but it appears to work fine without
+    // if let Err(error) = aya::programs::tc::qdisc_add_clsact(iface.as_str()) {
+    //     match error.kind() {
+    //         std::io::ErrorKind::AlreadyExists => {}
+    //         _ => log::warn!(
+    //             "failed to call aya::programs::tc::qdisc_add_clsact on {iface:?}: {error}"
+    //         ),
+    //     }
+    // }
 
     let ingress_impl = attach_ingress_counter(&mut ebpf, iface.as_str());
     let egress_impl = attach_egress_counter(&mut ebpf, iface.as_str());
