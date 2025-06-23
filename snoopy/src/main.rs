@@ -107,6 +107,14 @@ async fn main() -> anyhow::Result<()> {
                             ebpf_tasks.insert(interface.name.clone(), (kill_tx, handle));
                         }
                         Err(error) => {
+                            println!(
+                                "{}",
+                                serde_json::to_string(&InterfaceBpfInitializationFailed {
+                                    interface: interface.name.as_str(),
+                                    error: error.to_string().as_str(),
+                                })
+                                .unwrap()
+                            );
                             log::error!("failed to initialize ebpf module for {interface}: {error}")
                         }
                     }
@@ -156,6 +164,13 @@ struct InterfaceBpfInitialized<'a> {
     interface: &'a str,
     ingress_implementation: IngressImplementation,
     egress_implementation: EgressImplementation,
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type")]
+struct InterfaceBpfInitializationFailed<'a> {
+    interface: &'a str,
+    error: &'a str,
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Serialize, Deserialize)]
