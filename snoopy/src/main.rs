@@ -17,6 +17,7 @@ use pnet::datalink::NetworkInterface;
 use pnet::datalink::{self};
 use serde::Deserialize;
 use serde::Serialize;
+use serde_with::{serde_as, DisplayFromStr};
 
 // Snoopy
 #[derive(Debug, Default, Parser, Clone)]
@@ -139,9 +140,13 @@ async fn main() -> anyhow::Result<()> {
 }
 
 #[repr(C)]
+#[serde_as]
 #[derive(Debug, Default, Copy, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Counter {
+    #[serde_as(as = "DisplayFromStr")]
     pub packets: u64,
+
+    #[serde_as(as = "DisplayFromStr")]
     pub bytes: u64,
 }
 
