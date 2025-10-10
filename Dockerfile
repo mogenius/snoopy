@@ -1,4 +1,4 @@
-FROM docker.io/library/alpine:3.22.1 AS zig
+FROM docker.io/library/alpine:3.22.2 AS zig
 
 ARG ZIG_VERSION=0.14.0
 
@@ -74,7 +74,7 @@ RUN export ARCH="$(uname -m)" && \
     cp "target/powerpc64le-unknown-linux-musl/release/snoopy" "/usr/local/bin/snoopy_powerpc64le-unknown-linux-musl" && \
     cp "target/armv7-unknown-linux-musleabi/release/snoopy" "/usr/local/bin/snoopy_armv7-unknown-linux-musleabi"
 
-FROM docker.io/library/alpine:3.22.1
+FROM docker.io/library/alpine:3.22.2
 
 # COPY --from=snoopy "/usr/local/bin/snoopy" "/usr/local/bin/snoopy"
 COPY --from=snoopy "/usr/local/bin/snoopy_x86_64-unknown-linux-musl" "/usr/local/bin/snoopy_x86_64-unknown-linux-musl"
