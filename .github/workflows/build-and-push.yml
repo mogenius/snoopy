@@ -2,7 +2,7 @@ name: Build and Push
 on:
   push:
     branches:
-      - master
+      - main
 
 env:
   GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
