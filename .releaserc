@@ -1,7 +1,7 @@
 {
     "repositoryUrl": "https://github.com/mogenius/snoopy.git",
     "branches": [
-        "master",
+        "main",
         {
             "name": "develop",
             "prerelease": true
