@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::io::Write;
 use std::ops::Add;
+use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd};
 use std::path::Path;
 use std::str::FromStr;
 
@@ -18,13 +19,21 @@ use pnet::datalink::{self};
 use serde::Deserialize;
 use serde::Serialize;
 use serde_with::{serde_as, DisplayFromStr};
+use tokio::io::unix::AsyncFd;
+
+// Netlink multicast groups for interface and address change notifications
+const RTMGRP_LINK: u32 = 1;
+const RTMGRP_IPV4_IFADDR: u32 = 0x10;
+const RTMGRP_IPV6_IFADDR: u32 = 0x800;
+
+type EbpfTasks = HashMap<String, (tokio::sync::oneshot::Sender<()>, tokio::task::JoinHandle<()>)>;
 
 // Snoopy
 #[derive(Debug, Default, Parser, Clone)]
 #[command(version, about)]
 struct Arguments {
-    #[arg(long, default_value = "100")]
-    /// Polling rate for updating the network devices list
+    #[arg(long, default_value = "1000", hide = true)]
+    /// Deprecated: interface changes are now detected via netlink events, this value is ignored
     pub network_device_poll_rate: u64,
 
     #[arg(long, default_value = "500")]
@@ -72,69 +81,150 @@ async fn main() -> anyhow::Result<()> {
         ));
     }
 
-    let mut interface_update_interval = tokio::time::interval(std::time::Duration::from_millis(
-        args.network_device_poll_rate,
-    ));
+    // Bind the netlink socket before reading the initial interface list so that
+    // any changes occurring during startup are buffered and not missed.
+    let netlink_socket = create_netlink_socket()?;
     let mut network_interfaces = vec![];
-    let mut ebpf_tasks = HashMap::new();
+    let mut ebpf_tasks: EbpfTasks = HashMap::new();
+
+    // Initial population: treat every currently-present interface as Added.
+    handle_updates(
+        update_network_interfaces(&mut network_interfaces),
+        &args,
+        &mut ebpf_tasks,
+    )
+    .await;
 
     loop {
-        interface_update_interval.tick().await;
-        let network_interface_updates = update_network_interfaces(&mut network_interfaces);
-        for event in network_interface_updates.iter() {
-            println!("{}", serde_json::to_string(&event).unwrap());
+        // Block until the kernel sends a netlink notification (interface or
+        // address change), then drain all buffered messages before diffing.
+        let mut guard = netlink_socket.readable().await?;
+        guard.clear_ready();
+        drain_netlink_messages(netlink_socket.get_ref());
 
-            match event {
-                InterfaceUpdate::InterfaceAdded { interface } => {
-                    let (kill_tx, kill_rx) = tokio::sync::oneshot::channel::<()>();
-                    let args = args.clone();
-                    match initialize_ebpf_for_interface(interface.name.clone()).await {
-                        Ok((ebpf, ingress_impl, egress_impl)) => {
-                            println!(
-                                "{}",
-                                serde_json::to_string(&InterfaceBpfInitialized {
-                                    interface: interface.name.as_str(),
-                                    ingress_implementation: ingress_impl,
-                                    egress_implementation: egress_impl,
-                                })
-                                .unwrap()
-                            );
-                            let handle = tokio::spawn(attach_to_interface(
-                                args,
-                                interface.name.clone(),
-                                ebpf,
-                                kill_rx,
-                            ));
-                            ebpf_tasks.insert(interface.name.clone(), (kill_tx, handle));
-                        }
-                        Err(error) => {
-                            println!(
-                                "{}",
-                                serde_json::to_string(&InterfaceBpfInitializationFailed {
-                                    interface: interface.name.as_str(),
-                                    error: error.to_string().as_str(),
-                                })
-                                .unwrap()
-                            );
-                            log::error!("failed to initialize ebpf module for {interface}: {error}")
-                        }
+        handle_updates(
+            update_network_interfaces(&mut network_interfaces),
+            &args,
+            &mut ebpf_tasks,
+        )
+        .await;
+    }
+}
+
+async fn handle_updates(events: Vec<InterfaceUpdate>, args: &Arguments, ebpf_tasks: &mut EbpfTasks) {
+    for event in events.iter() {
+        println!("{}", serde_json::to_string(&event).unwrap());
+
+        match event {
+            InterfaceUpdate::InterfaceAdded { interface } => {
+                let (kill_tx, kill_rx) = tokio::sync::oneshot::channel::<()>();
+                let args = args.clone();
+                match initialize_ebpf_for_interface(interface.name.clone()).await {
+                    Ok((ebpf, ingress_impl, egress_impl)) => {
+                        println!(
+                            "{}",
+                            serde_json::to_string(&InterfaceBpfInitialized {
+                                interface: interface.name.as_str(),
+                                ingress_implementation: ingress_impl,
+                                egress_implementation: egress_impl,
+                            })
+                            .unwrap()
+                        );
+                        let handle = tokio::spawn(attach_to_interface(
+                            args,
+                            interface.name.clone(),
+                            ebpf,
+                            kill_rx,
+                        ));
+                        ebpf_tasks.insert(interface.name.clone(), (kill_tx, handle));
                     }
-                }
-                InterfaceUpdate::InterfaceRemoved { interface } => {
-                    log::info!("interface was removed: {interface:?}");
-                    if let Some((_, (kill_tx, handle))) =
-                        ebpf_tasks.remove_entry(interface.name.as_str())
-                    {
-                        let _ = kill_tx.send(());
-                        if handle.await.is_err() {
-                            log::error!("failed to join worker thread");
-                        }
+                    Err(error) => {
+                        println!(
+                            "{}",
+                            serde_json::to_string(&InterfaceBpfInitializationFailed {
+                                interface: interface.name.as_str(),
+                                error: error.to_string().as_str(),
+                            })
+                            .unwrap()
+                        );
+                        log::error!("failed to initialize ebpf module for {interface}: {error}")
                     }
-                }
-                InterfaceUpdate::InterfaceChanged { previous, new } => {
-                    log::info!("interface changed: {previous:?} -> {new:?}");
                 }
             }
+            InterfaceUpdate::InterfaceRemoved { interface } => {
+                log::info!("interface was removed: {interface:?}");
+                if let Some((_, (kill_tx, handle))) =
+                    ebpf_tasks.remove_entry(interface.name.as_str())
+                {
+                    let _ = kill_tx.send(());
+                    if handle.await.is_err() {
+                        log::error!("failed to join worker thread");
+                    }
+                }
+            }
+            InterfaceUpdate::InterfaceChanged { previous, new } => {
+                log::info!("interface changed: {previous:?} -> {new:?}");
+            }
+        }
+    }
+}
+
+fn create_netlink_socket() -> anyhow::Result<AsyncFd<OwnedFd>> {
+    let raw_fd = unsafe {
+        libc::socket(
+            libc::AF_NETLINK,
+            libc::SOCK_RAW | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC,
+            libc::NETLINK_ROUTE,
+        )
+    };
+    if raw_fd < 0 {
+        return Err(anyhow::anyhow!(
+            "failed to create netlink socket: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+
+    let addr = libc::sockaddr_nl {
+        nl_family: libc::AF_NETLINK as libc::sa_family_t,
+        nl_pad: 0,
+        nl_pid: 0,
+        nl_groups: RTMGRP_LINK | RTMGRP_IPV4_IFADDR | RTMGRP_IPV6_IFADDR,
+    };
+    let ret = unsafe {
+        libc::bind(
+            raw_fd,
+            &addr as *const libc::sockaddr_nl as *const libc::sockaddr,
+            std::mem::size_of::<libc::sockaddr_nl>() as libc::socklen_t,
+        )
+    };
+    if ret < 0 {
+        unsafe { libc::close(raw_fd) };
+        return Err(anyhow::anyhow!(
+            "failed to bind netlink socket: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+
+    let owned_fd = unsafe { OwnedFd::from_raw_fd(raw_fd) };
+    Ok(AsyncFd::new(owned_fd)?)
+}
+
+/// Drains all buffered netlink messages from the socket. We only need the
+/// wake-up signal, not the message contents — pnet's `datalink::interfaces()`
+/// gives us the authoritative current state afterwards.
+fn drain_netlink_messages(fd: &OwnedFd) {
+    let mut buf = [0u8; 4096];
+    loop {
+        let ret = unsafe {
+            libc::recv(
+                fd.as_raw_fd(),
+                buf.as_mut_ptr() as *mut libc::c_void,
+                buf.len(),
+                libc::MSG_DONTWAIT,
+            )
+        };
+        if ret <= 0 {
+            break;
         }
     }
 }
