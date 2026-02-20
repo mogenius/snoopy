@@ -184,12 +184,12 @@ fn create_netlink_socket() -> anyhow::Result<AsyncFd<OwnedFd>> {
         ));
     }
 
-    let addr = libc::sockaddr_nl {
-        nl_family: libc::AF_NETLINK as libc::sa_family_t,
-        nl_pad: 0,
-        nl_pid: 0,
-        nl_groups: RTMGRP_LINK | RTMGRP_IPV4_IFADDR | RTMGRP_IPV6_IFADDR,
-    };
+    // Use zeroed() to avoid field-by-field init of libc padding types
+    // (nl_pad is `Padding<u16>` in newer libc versions)
+    let mut addr: libc::sockaddr_nl = unsafe { std::mem::zeroed() };
+    addr.nl_family = libc::AF_NETLINK as libc::sa_family_t;
+    addr.nl_pid = 0;
+    addr.nl_groups = RTMGRP_LINK | RTMGRP_IPV4_IFADDR | RTMGRP_IPV6_IFADDR;
     let ret = unsafe {
         libc::bind(
             raw_fd,
