@@ -413,40 +413,36 @@ fn update_network_interfaces(
     let new_interfaces = datalink::interfaces();
     let mut updates = vec![];
 
+    let old_map: HashMap<&str, &NetworkInterface> =
+        network_interfaces.iter().map(|i| (i.name.as_str(), i)).collect();
+
+    let new_map: HashMap<&str, &NetworkInterface> =
+        new_interfaces.iter().map(|i| (i.name.as_str(), i)).collect();
+
     for new_interface in new_interfaces.iter() {
-        let previous_interface = network_interfaces
-            .iter_mut()
-            .find(|interface| new_interface.name.as_str() == interface.name);
-        let previous_interface = match previous_interface {
-            Some(previous_interface) => previous_interface,
-            None => {
-                updates.push(InterfaceUpdate::InterfaceAdded {
-                    interface: new_interface.clone(),
-                });
-                continue;
+        match old_map.get(new_interface.name.as_str()) {
+            None => updates.push(InterfaceUpdate::InterfaceAdded {
+                interface: new_interface.clone(),
+            }),
+            Some(old_interface) if new_interface != *old_interface => {
+                updates.push(InterfaceUpdate::InterfaceChanged {
+                    previous: (*old_interface).clone(),
+                    new: new_interface.clone(),
+                })
             }
-        };
-
-        if new_interface != previous_interface {
-            updates.push(InterfaceUpdate::InterfaceChanged {
-                previous: previous_interface.clone(),
-                new: new_interface.clone(),
-            });
-            continue;
+            _ => {}
         }
     }
-    for previous_interface in network_interfaces.iter() {
-        if !new_interfaces
-            .iter()
-            .any(|interface| previous_interface.name == interface.name)
-        {
+
+    for old_interface in network_interfaces.iter() {
+        if !new_map.contains_key(old_interface.name.as_str()) {
             updates.push(InterfaceUpdate::InterfaceRemoved {
-                interface: previous_interface.clone(),
+                interface: old_interface.clone(),
             });
         }
     }
 
-    let _ = std::mem::replace(network_interfaces, new_interfaces);
+    *network_interfaces = new_interfaces;
 
     updates
 }
