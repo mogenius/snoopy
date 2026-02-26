@@ -75,10 +75,14 @@ async fn main() -> anyhow::Result<()> {
     };
     let ret = unsafe { libc::setrlimit(libc::RLIMIT_MEMLOCK, &rlim) };
     if ret != 0 {
-        return Err(anyhow::anyhow!(
-            "remove limit on locked memory failed, ret is: {}",
+        // On modern kernels (≥5.11) eBPF memory accounting is cgroup-based and
+        // RLIMIT_MEMLOCK is irrelevant. Failing here is not fatal; we log a warning
+        // and continue. Without CAP_SYS_RESOURCE (e.g. when privileged:true is not
+        // set) this call will fail on most container runtimes — that is acceptable.
+        log::warn!(
+            "setrlimit(RLIMIT_MEMLOCK, RLIM_INFINITY) failed (ret={}): running without raised memlock limit; this is fine on kernels ≥5.11",
             ret
-        ));
+        );
     }
 
     // Bind the netlink socket before reading the initial interface list so that
