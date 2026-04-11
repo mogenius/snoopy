@@ -11,7 +11,7 @@ jobs:
     runs-on: MEGA-FAST
     steps:
     - name: Checkout Repository
-      uses: actions/checkout@v5
+      uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
 
     - name: Semantic Release
       id: semantic_release
@@ -36,7 +36,7 @@ jobs:
         docker rm $container_id
 
     - name: Release
-      uses: softprops/action-gh-release@v2
+      uses: softprops/action-gh-release@153bb8e04406b158c6c84fc1615b65b24149a1fe # v2
       if: ${{ steps.semantic_release.outputs.new_release_published }} # only run if a new release is published
       with:
         tag_name: v${{ steps.semantic_release.outputs.new_release_version }}
