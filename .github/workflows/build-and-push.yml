@@ -15,6 +15,15 @@ jobs:
       with:
         fetch-depth: 0
 
+    # cycjimmy/semantic-release-action shells out to `npm ci` to install
+    # semantic-release + plugins. The self-hosted runner has no npm in PATH,
+    # so the step exits 127 silently (action still reports success but
+    # `new_release_published` stays empty -> the Release step gets skipped).
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: '24'
+
     - name: Semantic Release
       id: semantic_release
       uses: cycjimmy/semantic-release-action@b12c8f6015dc215fe37bc154d4ad456dd3833c90 # v6.0.0
