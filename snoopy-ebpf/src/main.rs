@@ -75,11 +75,10 @@ pub fn update_xdp_ingress(ctx: XdpContext) -> u32 {
 
 #[inline]
 fn try_update_xdp_ingress(ctx: &XdpContext) -> Result<(), &'static str> {
-    let data = ctx.data() as u64;
-    let data_end = ctx.data_end() as u64;
-    let metadata = ctx.metadata() as u64;
-    let metadata_end = ctx.metadata_end() as u64;
-    let bytes = (data_end - data) + (metadata_end - metadata);
+    // On-wire bytes only — XDP metadata (bpf_xdp_adjust_meta region) is driver/HW
+    // scratch space, not part of the packet, so omit it to match the TC variant
+    // which uses ctx.len().
+    let bytes = ctx.data_end() as u64 - ctx.data() as u64;
 
     let counter = INGRESS_COUNTER
         .get_ptr_mut(0)

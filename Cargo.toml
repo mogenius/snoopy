@@ -17,6 +17,13 @@ cargo_metadata = { version = "0.23.1", default-features = false }
 log = { version = "0.4.28", default-features = false }
 which = { version = "8.0.0", features=["real-sys"], default-features = false }
 
+[profile.release]
+lto = "fat"
+codegen-units = 1
+strip = "symbols"
+panic = "abort"
+opt-level = 3
+
 [profile.release.package.snoopy-ebpf]
 debug = 2
 codegen-units = 1

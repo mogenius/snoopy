@@ -41,7 +41,7 @@ struct Arguments {
     pub metrics_rate: u64,
 }
 
-#[tokio::main(worker_threads = 2)]
+#[tokio::main(flavor = "current_thread")]
 async fn main() -> anyhow::Result<()> {
     if std::env::var("RUST_LOG").is_err() {
         unsafe {
