@@ -53,3 +53,62 @@ jobs:
         tag_name: v${{ steps.semantic_release.outputs.new_release_version }}
         files: |
           ./output/*
+
+    # Release notes and commit messages are passed via env instead of being
+    # interpolated into the script, so their content can't break out of the shell.
+    - name: Job Summary
+      if: ${{ always() }}
+      env:
+        RELEASE_PUBLISHED: ${{ steps.semantic_release.outputs.new_release_published }}
+        RELEASE_VERSION: ${{ steps.semantic_release.outputs.new_release_version }}
+        LAST_VERSION: ${{ steps.semantic_release.outputs.last_release_version }}
+        RELEASE_NOTES: ${{ steps.semantic_release.outputs.new_release_notes }}
+      run: |
+        {
+          echo "## 🐕 Snoopy Build Summary"
+          echo ""
+          if [ "${RELEASE_PUBLISHED}" = "true" ]; then
+            echo "### 🚀 New release: \`v${RELEASE_VERSION}\`"
+            echo ""
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Previous version | \`v${LAST_VERSION:-none}\` |"
+            echo "| New version | \`v${RELEASE_VERSION}\` |"
+            echo "| Release | [v${RELEASE_VERSION}](https://github.com/${GITHUB_REPOSITORY}/releases/tag/v${RELEASE_VERSION}) |"
+          else
+            echo "### ℹ️ No new release"
+            echo ""
+            echo "No release-relevant commits since \`v${LAST_VERSION:-none}\` — the Docker build ran as a sanity check only."
+          fi
+          echo ""
+
+          if [ -n "${LAST_VERSION}" ] && git rev-parse "v${LAST_VERSION}" >/dev/null 2>&1; then
+            echo "### 🔀 Commits since v${LAST_VERSION}"
+            echo ""
+            git log "v${LAST_VERSION}..HEAD" --no-merges --pretty=format:'- `%h` %s (%an)' | head -50
+            echo ""
+            echo ""
+          fi
+
+          if [ -d output ] && [ -n "$(ls -A output 2>/dev/null)" ]; then
+            echo "### 📦 Binaries"
+            echo ""
+            echo "| Binary | Size |"
+            echo "|---|---|"
+            for f in output/*; do
+              echo "| \`$(basename "${f}")\` | $(du -h "${f}" | cut -f1) |"
+            done
+            echo ""
+          else
+            echo "### ⚠️ No binaries were extracted"
+            echo ""
+          fi
+
+          if [ "${RELEASE_PUBLISHED}" = "true" ] && [ -n "${RELEASE_NOTES}" ]; then
+            echo "<details><summary>📝 Release Notes</summary>"
+            echo ""
+            echo "${RELEASE_NOTES}"
+            echo ""
+            echo "</details>"
+          fi
+        } >> "${GITHUB_STEP_SUMMARY}"
