@@ -24,6 +24,12 @@ RUN cargo install bpf-linker
 
 FROM docker.io/library/rust:1.96.0 AS builder
 
+# Pinned nightly toolchain for the eBPF build (consumed by snoopy/build.rs via
+# SNOOPY_EBPF_TOOLCHAIN). Bump deliberately; an unpinned `nightly` makes builds
+# non-reproducible and can break overnight.
+ARG RUST_NIGHTLY_TOOLCHAIN=nightly-2026-07-03
+ENV SNOOPY_EBPF_TOOLCHAIN=${RUST_NIGHTLY_TOOLCHAIN}
+
 COPY --from=zig /opt/zig /opt/zig
 ENV PATH="/opt/zig:${PATH}"
 COPY --from=cargo-zigbuild "/usr/local/cargo/bin/cargo-zigbuild" "/usr/local/bin/cargo-zigbuild"
@@ -36,8 +42,7 @@ RUN export ARCH="$(uname -m)" && \
         *) printf "Unsupported architecture: %s\n" "${ARCH}"; exit 1 ;; \
     esac && \
     set -eux && \
-    rustup toolchain install "nightly" --component "rust-src" && \
-    # rustup target add "${ARCH}-unknown-linux-musl"
+    rustup toolchain install "${RUST_NIGHTLY_TOOLCHAIN}" --component "rust-src" --component "rustfmt" && \
     rustup target add "x86_64-unknown-linux-musl" && \
     rustup target add "aarch64-unknown-linux-musl" && \
     rustup target add "armv7-unknown-linux-musleabi" && \
@@ -61,14 +66,11 @@ RUN export ARCH="$(uname -m)" && \
         *) printf "Unsupported architecture: %s\n" "${ARCH}"; exit 1 ;; \
     esac && \
     set -eux && \
-    # cargo zigbuild --package "snoopy" --release --target="${ARCH}-unknown-linux-musl" && \
     cargo zigbuild --package "snoopy" --release --target="x86_64-unknown-linux-musl" && \
     cargo zigbuild --package "snoopy" --release --target="aarch64-unknown-linux-musl" && \
     cargo zigbuild --package "snoopy" --release --target="armv7-unknown-linux-musleabi" && \
     cargo zigbuild --package "snoopy" --release --target="riscv64gc-unknown-linux-musl" && \
     cargo zigbuild --package "snoopy" --release --target="powerpc64le-unknown-linux-musl" && \
-    mkdir "dist" && \
-    # cp "target/${ARCH}-unknown-linux-musl/release/snoopy" "/usr/local/bin/snoopy"
     cp "target/x86_64-unknown-linux-musl/release/snoopy" "/usr/local/bin/snoopy_x86_64-unknown-linux-musl" && \
     cp "target/aarch64-unknown-linux-musl/release/snoopy" "/usr/local/bin/snoopy_aarch64-unknown-linux-musl" && \
     cp "target/riscv64gc-unknown-linux-musl/release/snoopy" "/usr/local/bin/snoopy_riscv64-unknown-linux-musl" && \
@@ -77,7 +79,6 @@ RUN export ARCH="$(uname -m)" && \
 
 FROM docker.io/library/alpine:3.24.1
 
-# COPY --from=snoopy "/usr/local/bin/snoopy" "/usr/local/bin/snoopy"
 COPY --from=snoopy "/usr/local/bin/snoopy_x86_64-unknown-linux-musl" "/usr/local/bin/snoopy_x86_64-unknown-linux-musl"
 COPY --from=snoopy "/usr/local/bin/snoopy_aarch64-unknown-linux-musl" "/usr/local/bin/snoopy_aarch64-unknown-linux-musl"
 COPY --from=snoopy "/usr/local/bin/snoopy_armv7-unknown-linux-musleabi" "/usr/local/bin/snoopy_armv7-unknown-linux-musleabi"

@@ -1,0 +1,39 @@
+name: PR Check
+on:
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout Repository
+      uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+
+    # Reuse the builder stage of the release Dockerfile so PR checks run in the
+    # exact same environment (pinned nightly, zig, bpf-linker) as release builds.
+    - name: Build builder image
+      run: docker build --pull --target builder -t snoopy-builder .
+
+    - name: Format check
+      run: >
+        docker run --rm -v "$PWD:/app" -v /tmp/cargo-target:/cargo-target
+        -e CARGO_TARGET_DIR=/cargo-target -w /app snoopy-builder
+        sh -c 'cargo "+${SNOOPY_EBPF_TOOLCHAIN}" fmt --check'
+
+    - name: Clippy
+      run: >
+        docker run --rm -v "$PWD:/app" -v /tmp/cargo-target:/cargo-target
+        -e CARGO_TARGET_DIR=/cargo-target -w /app snoopy-builder
+        sh -c 'rustup component add clippy && cargo clippy --package snoopy --target x86_64-unknown-linux-musl -- -D warnings'
+
+    - name: Test
+      run: >
+        docker run --rm -v "$PWD:/app" -v /tmp/cargo-target:/cargo-target
+        -e CARGO_TARGET_DIR=/cargo-target -w /app snoopy-builder
+        cargo test --package snoopy
+
+    - name: Build (x86_64-unknown-linux-musl)
+      run: >
+        docker run --rm -v "$PWD:/app" -v /tmp/cargo-target:/cargo-target
+        -e CARGO_TARGET_DIR=/cargo-target -w /app snoopy-builder
+        cargo zigbuild --package snoopy --release --target x86_64-unknown-linux-musl

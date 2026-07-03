@@ -24,5 +24,13 @@ fn main() -> anyhow::Result<()> {
             .as_str(),
         ..Default::default()
     };
-    aya_build::build_ebpf([ebpf_package], Toolchain::default())
+    // Allow pinning the nightly toolchain used for the eBPF build (set in the
+    // Dockerfile); local builds fall back to the floating `nightly` channel.
+    println!("cargo:rerun-if-env-changed=SNOOPY_EBPF_TOOLCHAIN");
+    let toolchain_override = std::env::var("SNOOPY_EBPF_TOOLCHAIN").ok();
+    let toolchain = toolchain_override
+        .as_deref()
+        .map(Toolchain::Custom)
+        .unwrap_or_default();
+    aya_build::build_ebpf([ebpf_package], toolchain)
 }

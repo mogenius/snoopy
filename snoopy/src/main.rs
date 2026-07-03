@@ -1,7 +1,9 @@
 use std::collections::HashMap;
 use std::io::Write;
 use std::ops::Add;
-use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::unix::io::AsRawFd;
+use std::os::unix::io::FromRawFd;
+use std::os::unix::io::OwnedFd;
 use std::path::Path;
 use std::str::FromStr;
 
@@ -11,14 +13,16 @@ use aya::Pod;
 use aya::programs::SchedClassifier;
 use aya::programs::TcAttachType;
 use aya::programs::Xdp;
-use aya::programs::XdpFlags;
+use aya::programs::XdpMode;
+use aya::programs::tc::TcError;
 use clap::Parser;
 use env_logger::Target;
 use pnet::datalink::NetworkInterface;
 use pnet::datalink::{self};
 use serde::Deserialize;
 use serde::Serialize;
-use serde_with::{serde_as, DisplayFromStr};
+use serde_with::DisplayFromStr;
+use serde_with::serde_as;
 use tokio::io::unix::AsyncFd;
 
 // Netlink multicast groups for interface and address change notifications
@@ -26,7 +30,13 @@ const RTMGRP_LINK: u32 = 1;
 const RTMGRP_IPV4_IFADDR: u32 = 0x10;
 const RTMGRP_IPV6_IFADDR: u32 = 0x800;
 
-type EbpfTasks = HashMap<String, (tokio::sync::oneshot::Sender<()>, tokio::task::JoinHandle<()>)>;
+type EbpfTasks = HashMap<
+    String,
+    (
+        tokio::sync::oneshot::Sender<()>,
+        tokio::task::JoinHandle<()>,
+    ),
+>;
 
 // Snoopy
 #[derive(Debug, Default, Parser, Clone)]
@@ -115,7 +125,11 @@ async fn main() -> anyhow::Result<()> {
     }
 }
 
-async fn handle_updates(events: Vec<InterfaceUpdate>, args: &Arguments, ebpf_tasks: &mut EbpfTasks) {
+async fn handle_updates(
+    events: Vec<InterfaceUpdate>,
+    args: &Arguments,
+    ebpf_tasks: &mut EbpfTasks,
+) {
     for event in events.iter() {
         println!("{}", serde_json::to_string(&event).unwrap());
 
@@ -332,11 +346,13 @@ async fn initialize_ebpf_for_interface(
     }
 
     if let Err(error) = aya::programs::tc::qdisc_add_clsact(iface.as_str()) {
-        match error.kind() {
-            std::io::ErrorKind::AlreadyExists => {}
-            _ => log::warn!(
-                "failed to call aya::programs::tc::qdisc_add_clsact on {iface:?}: {error}"
-            ),
+        let already_exists = matches!(
+            &error,
+            TcError::NetlinkError(netlink_error)
+                if netlink_error.raw_os_error() == Some(libc::EEXIST)
+        );
+        if !already_exists {
+            log::warn!("failed to call aya::programs::tc::qdisc_add_clsact on {iface:?}: {error}");
         }
     }
 
@@ -407,8 +423,8 @@ fn attach_ingress_xdp_counter(ebpf: &mut aya::Ebpf, iface: &str) -> anyhow::Resu
     let ingress_program: &mut Xdp = ebpf.program_mut("update_xdp_ingress").unwrap().try_into()?;
     ingress_program.load()?;
     ingress_program
-        .attach(iface, XdpFlags::default())
-        .map_err(|err| anyhow!("failed to attach the XDP program with default flags: {err}"))?;
+        .attach(iface, XdpMode::default())
+        .map_err(|err| anyhow!("failed to attach the XDP program with default mode: {err}"))?;
 
     Ok(())
 }
@@ -458,13 +474,27 @@ fn handle_metrics_update(
     ingress_map: &aya::maps::PerCpuArray<&aya::maps::MapData, Counter>,
     egress_map: &aya::maps::PerCpuArray<&aya::maps::MapData, Counter>,
 ) {
+    let ingress_values = match ingress_map.get(&0, 0) {
+        Ok(values) => values,
+        Err(error) => {
+            log::error!("failed to read INGRESS_COUNTER map for {iface}: {error}");
+            return;
+        }
+    };
     let mut ingress_counter = Counter::default();
-    for counter in ingress_map.get(&0, 0).unwrap().iter() {
+    for counter in ingress_values.iter() {
         ingress_counter = ingress_counter + *counter;
     }
 
+    let egress_values = match egress_map.get(&0, 0) {
+        Ok(values) => values,
+        Err(error) => {
+            log::error!("failed to read EGRESS_COUNTER map for {iface}: {error}");
+            return;
+        }
+    };
     let mut egress_counter = Counter::default();
-    for counter in egress_map.get(&0, 0).unwrap().iter() {
+    for counter in egress_values.iter() {
         egress_counter = egress_counter + *counter;
     }
 
@@ -504,14 +534,26 @@ pub enum InterfaceUpdate {
 fn update_network_interfaces(
     network_interfaces: &mut Vec<NetworkInterface>,
 ) -> Vec<InterfaceUpdate> {
-    let new_interfaces = datalink::interfaces();
+    diff_network_interfaces(network_interfaces, datalink::interfaces())
+}
+
+/// Diffs the tracked interface state against `new_interfaces`, returning the
+/// resulting updates and replacing the tracked state with the new one.
+fn diff_network_interfaces(
+    network_interfaces: &mut Vec<NetworkInterface>,
+    new_interfaces: Vec<NetworkInterface>,
+) -> Vec<InterfaceUpdate> {
     let mut updates = vec![];
 
-    let old_map: HashMap<&str, &NetworkInterface> =
-        network_interfaces.iter().map(|i| (i.name.as_str(), i)).collect();
+    let old_map: HashMap<&str, &NetworkInterface> = network_interfaces
+        .iter()
+        .map(|i| (i.name.as_str(), i))
+        .collect();
 
-    let new_map: HashMap<&str, &NetworkInterface> =
-        new_interfaces.iter().map(|i| (i.name.as_str(), i)).collect();
+    let new_map: HashMap<&str, &NetworkInterface> = new_interfaces
+        .iter()
+        .map(|i| (i.name.as_str(), i))
+        .collect();
 
     for new_interface in new_interfaces.iter() {
         match old_map.get(new_interface.name.as_str()) {
@@ -539,4 +581,108 @@ fn update_network_interfaces(
     *network_interfaces = new_interfaces;
 
     updates
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn interface(name: &str, index: u32, flags: u32) -> NetworkInterface {
+        NetworkInterface {
+            name: name.to_string(),
+            description: String::new(),
+            index,
+            mac: None,
+            ips: vec![],
+            flags,
+        }
+    }
+
+    /// Diffs `new` against the tracked state in `current` and returns the
+    /// emitted updates alongside the new tracked state.
+    fn diff(
+        current: Vec<NetworkInterface>,
+        new: Vec<NetworkInterface>,
+    ) -> (Vec<InterfaceUpdate>, Vec<NetworkInterface>) {
+        let mut tracked = current;
+        let updates = diff_network_interfaces(&mut tracked, new);
+        (updates, tracked)
+    }
+
+    #[test]
+    fn initial_population_reports_all_interfaces_as_added() {
+        let (updates, tracked) = diff(vec![], vec![interface("lo", 1, 0), interface("eth0", 2, 0)]);
+
+        assert_eq!(updates.len(), 2);
+        assert!(matches!(
+            &updates[0],
+            InterfaceUpdate::InterfaceAdded { interface } if interface.name == "lo"
+        ));
+        assert!(matches!(
+            &updates[1],
+            InterfaceUpdate::InterfaceAdded { interface } if interface.name == "eth0"
+        ));
+        assert_eq!(tracked.len(), 2);
+    }
+
+    #[test]
+    fn unchanged_interfaces_produce_no_updates() {
+        let interfaces = vec![interface("eth0", 2, 0)];
+        let (updates, tracked) = diff(interfaces.clone(), interfaces.clone());
+
+        assert!(updates.is_empty());
+        assert_eq!(tracked, interfaces);
+    }
+
+    #[test]
+    fn removed_interface_is_reported_and_dropped_from_state() {
+        let (updates, tracked) = diff(
+            vec![interface("eth0", 2, 0), interface("eth1", 3, 0)],
+            vec![interface("eth0", 2, 0)],
+        );
+
+        assert_eq!(updates.len(), 1);
+        assert!(matches!(
+            &updates[0],
+            InterfaceUpdate::InterfaceRemoved { interface } if interface.name == "eth1"
+        ));
+        assert_eq!(tracked.len(), 1);
+    }
+
+    #[test]
+    fn changed_interface_reports_previous_and_new_state() {
+        let (updates, _) = diff(vec![interface("eth0", 2, 0)], vec![interface("eth0", 2, 1)]);
+
+        assert_eq!(updates.len(), 1);
+        match &updates[0] {
+            InterfaceUpdate::InterfaceChanged { previous, new } => {
+                assert_eq!(previous.flags, 0);
+                assert_eq!(new.flags, 1);
+            }
+            other => panic!("expected InterfaceChanged, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn add_change_and_remove_are_reported_together() {
+        let (updates, tracked) = diff(
+            vec![interface("eth0", 2, 0), interface("eth1", 3, 0)],
+            vec![interface("eth0", 2, 1), interface("eth2", 4, 0)],
+        );
+
+        assert_eq!(updates.len(), 3);
+        assert!(matches!(
+            &updates[0],
+            InterfaceUpdate::InterfaceChanged { new, .. } if new.name == "eth0"
+        ));
+        assert!(matches!(
+            &updates[1],
+            InterfaceUpdate::InterfaceAdded { interface } if interface.name == "eth2"
+        ));
+        assert!(matches!(
+            &updates[2],
+            InterfaceUpdate::InterfaceRemoved { interface } if interface.name == "eth1"
+        ));
+        assert_eq!(tracked.len(), 2);
+    }
 }
