@@ -24,7 +24,7 @@ RUN cargo install cargo-zigbuild
 # (the rust-llvm-* features were dropped), so we use the prebuilt binary.
 FROM docker.io/library/alpine:3.24.1 AS bpf-linker
 
-ARG BPF_LINKER_VERSION=v0.11.0
+ARG BPF_LINKER_VERSION=v0.11.1
 
 RUN export ARCH="$(uname -m)" && \
     case "${ARCH}" in \
