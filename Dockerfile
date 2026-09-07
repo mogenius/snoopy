@@ -18,9 +18,26 @@ FROM docker.io/library/rust:1.98.0 AS cargo-zigbuild
 
 RUN cargo install cargo-zigbuild
 
-FROM docker.io/library/rust:1.98.0 AS bpf-linker
+# Pinned bpf-linker release (github.com/aya-rs/bpf-linker). Upstream ships
+# statically linked musl binaries with LLVM bundled. Since bpf-linker v0.11.0
+# `cargo install bpf-linker` no longer works without a matching system LLVM
+# (the rust-llvm-* features were dropped), so we use the prebuilt binary.
+FROM docker.io/library/alpine:3.24.1 AS bpf-linker
 
-RUN cargo install bpf-linker
+ARG BPF_LINKER_VERSION=v0.11.0
+
+RUN export ARCH="$(uname -m)" && \
+    case "${ARCH}" in \
+        x86_64) ;; \
+        aarch64) ;; \
+        *) printf "Unsupported architecture: %s\n" "${ARCH}"; exit 1 ;; \
+    esac && \
+    set -eux && \
+    apk add --no-cache zstd && \
+    wget -O "/bpf-linker.tar.zst" "https://github.com/aya-rs/bpf-linker/releases/download/${BPF_LINKER_VERSION}/bpf-linker-${ARCH}-unknown-linux-musl.tar.zst" && \
+    mkdir -p /opt/bpf-linker && \
+    zstd -dc "/bpf-linker.tar.zst" | tar -x -C /opt/bpf-linker && \
+    test -x /opt/bpf-linker/bpf-linker
 
 FROM docker.io/library/rust:1.98.0 AS builder
 
@@ -33,7 +50,7 @@ ENV SNOOPY_EBPF_TOOLCHAIN=${RUST_NIGHTLY_TOOLCHAIN}
 COPY --from=zig /opt/zig /opt/zig
 ENV PATH="/opt/zig:${PATH}"
 COPY --from=cargo-zigbuild "/usr/local/cargo/bin/cargo-zigbuild" "/usr/local/bin/cargo-zigbuild"
-COPY --from=bpf-linker "/usr/local/cargo/bin/bpf-linker" "/usr/local/bin/bpf-linker"
+COPY --from=bpf-linker "/opt/bpf-linker/bpf-linker" "/usr/local/bin/bpf-linker"
 
 RUN export ARCH="$(uname -m)" && \
     case "${ARCH}" in \
@@ -56,8 +73,15 @@ WORKDIR /app
 
 RUN cargo install cargo-set-version
 
-RUN VERSION=$(git describe --tags $(git rev-list --tags --max-count=1) | sed 's/^v//') && \
-    cargo-set-version ${VERSION}
+# Release version to stamp into the binary. The CI passes the version that
+# semantic-release is about to publish (the build runs *before* the tag is
+# created so a failed build can't leave behind an empty release). Fallback:
+# latest existing tag, for local / sanity builds.
+ARG SNOOPY_VERSION
+RUN VERSION="${SNOOPY_VERSION:-$(git describe --tags $(git rev-list --tags --max-count=1) | sed 's/^v//')}" && \
+    VERSION="${VERSION#v}" && \
+    echo "snoopy version: ${VERSION}" && \
+    cargo-set-version "${VERSION}"
 
 RUN export ARCH="$(uname -m)" && \
     case "${ARCH}" in \

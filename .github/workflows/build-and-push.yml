@@ -24,14 +24,25 @@ jobs:
       with:
         node-version: '24'
 
-    - name: Semantic Release
-      id: semantic_release
+    # Two-phase release: a dry run first determines whether a release is due and
+    # which version it gets, then the Docker image is built with that version.
+    # Only after the build and binary extraction succeeded does the real
+    # semantic-release run create the tag + GitHub release and the assets get
+    # uploaded. Previously the tag/release was created *before* the build, so a
+    # failed build left an empty release behind (v0.4.14, v0.4.15) which
+    # downstream consumers (mogenius-operator) then tried to download -> 404.
+    - name: Semantic Release (dry run)
+      id: semantic_release_dry_run
       uses: cycjimmy/semantic-release-action@b12c8f6015dc215fe37bc154d4ad456dd3833c90 # v6.0.0
+      with:
+        dry_run: true
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
     - name: Build the Docker image
-      run: docker build --pull -t snoopy:latest .
+      env:
+        NEW_RELEASE_VERSION: ${{ steps.semantic_release_dry_run.outputs.new_release_version }}
+      run: docker build --pull --build-arg "SNOOPY_VERSION=${NEW_RELEASE_VERSION}" -t snoopy:latest .
 
     - name: Create output directory for binaries
       run: mkdir -p output
@@ -46,9 +57,16 @@ jobs:
         docker cp $container_id:/usr/local/bin/snoopy_armv7-unknown-linux-musleabi ./output/snoopy_armv7
         docker rm $container_id
 
+    - name: Semantic Release
+      id: semantic_release
+      if: ${{ steps.semantic_release_dry_run.outputs.new_release_published == 'true' }}
+      uses: cycjimmy/semantic-release-action@b12c8f6015dc215fe37bc154d4ad456dd3833c90 # v6.0.0
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
     - name: Release
       uses: softprops/action-gh-release@b4309332981a82ec1c5618f44dd2e27cc8bfbfda # v3
-      if: ${{ steps.semantic_release.outputs.new_release_published }} # only run if a new release is published
+      if: ${{ steps.semantic_release.outputs.new_release_published == 'true' }} # only run if a new release is published
       with:
         tag_name: v${{ steps.semantic_release.outputs.new_release_version }}
         files: |
@@ -60,9 +78,9 @@ jobs:
       if: ${{ always() }}
       env:
         RELEASE_PUBLISHED: ${{ steps.semantic_release.outputs.new_release_published }}
-        RELEASE_VERSION: ${{ steps.semantic_release.outputs.new_release_version }}
-        LAST_VERSION: ${{ steps.semantic_release.outputs.last_release_version }}
-        RELEASE_NOTES: ${{ steps.semantic_release.outputs.new_release_notes }}
+        RELEASE_VERSION: ${{ steps.semantic_release_dry_run.outputs.new_release_version }}
+        LAST_VERSION: ${{ steps.semantic_release_dry_run.outputs.last_release_version }}
+        RELEASE_NOTES: ${{ steps.semantic_release_dry_run.outputs.new_release_notes }}
       run: |
         {
           echo "## 🐕 Snoopy Build Summary"
