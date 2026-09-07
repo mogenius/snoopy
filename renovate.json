@@ -8,5 +8,19 @@
   "patch": {
     "automerge": true
   },
-  "prCreation": "not-pending"
+  "prCreation": "not-pending",
+  "customManagers": [
+    {
+      "description": "Update the pinned bpf-linker release in the Dockerfile",
+      "customType": "regex",
+      "managerFilePatterns": [
+        "/^Dockerfile$/"
+      ],
+      "matchStrings": [
+        "BPF_LINKER_VERSION=(?<currentValue>v[\\d.]+)"
+      ],
+      "depNameTemplate": "aya-rs/bpf-linker",
+      "datasourceTemplate": "github-releases"
+    }
+  ]
 }
