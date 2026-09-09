@@ -14,7 +14,7 @@ RUN export ARCH="$(uname -m)" && \
     cd /opt && \
     mv "zig-linux-${ARCH}-${ZIG_VERSION}" "zig"
 
-FROM docker.io/library/rust:1.98.0 AS cargo-zigbuild
+FROM docker.io/library/rust:1.98.1 AS cargo-zigbuild
 
 RUN cargo install cargo-zigbuild
 
@@ -39,7 +39,7 @@ RUN export ARCH="$(uname -m)" && \
     zstd -dc "/bpf-linker.tar.zst" | tar -x -C /opt/bpf-linker && \
     test -x /opt/bpf-linker/bpf-linker
 
-FROM docker.io/library/rust:1.98.0 AS builder
+FROM docker.io/library/rust:1.98.1 AS builder
 
 # Pinned nightly toolchain for the eBPF build (consumed by snoopy/build.rs via
 # SNOOPY_EBPF_TOOLCHAIN). Bump deliberately; an unpinned `nightly` makes builds
