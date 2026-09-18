@@ -1,4 +1,4 @@
-FROM docker.io/library/alpine:3.24.1 AS zig
+FROM docker.io/library/alpine:3.24.2 AS zig
 
 ARG ZIG_VERSION=0.14.0
 
@@ -22,7 +22,7 @@ RUN cargo install cargo-zigbuild
 # statically linked musl binaries with LLVM bundled. Since bpf-linker v0.11.0
 # `cargo install bpf-linker` no longer works without a matching system LLVM
 # (the rust-llvm-* features were dropped), so we use the prebuilt binary.
-FROM docker.io/library/alpine:3.24.1 AS bpf-linker
+FROM docker.io/library/alpine:3.24.2 AS bpf-linker
 
 ARG BPF_LINKER_VERSION=v0.11.1
 
@@ -101,7 +101,7 @@ RUN export ARCH="$(uname -m)" && \
     cp "target/powerpc64le-unknown-linux-musl/release/snoopy" "/usr/local/bin/snoopy_powerpc64le-unknown-linux-musl" && \
     cp "target/armv7-unknown-linux-musleabi/release/snoopy" "/usr/local/bin/snoopy_armv7-unknown-linux-musleabi"
 
-FROM docker.io/library/alpine:3.24.1
+FROM docker.io/library/alpine:3.24.2
 
 COPY --from=snoopy "/usr/local/bin/snoopy_x86_64-unknown-linux-musl" "/usr/local/bin/snoopy_x86_64-unknown-linux-musl"
 COPY --from=snoopy "/usr/local/bin/snoopy_aarch64-unknown-linux-musl" "/usr/local/bin/snoopy_aarch64-unknown-linux-musl"
