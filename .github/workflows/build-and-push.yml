@@ -33,7 +33,7 @@ jobs:
     # downstream consumers (mogenius-operator) then tried to download -> 404.
     - name: Semantic Release (dry run)
       id: semantic_release_dry_run
-      uses: cycjimmy/semantic-release-action@1989a0fefc4aea321e07f717680ed8e345925dc1 # v7.1.2
+      uses: cycjimmy/semantic-release-action@03595b5eaf44910cf239ff20904cc52d410f97d4 # v8.1.2
       with:
         dry_run: true
       env:
@@ -60,7 +60,7 @@ jobs:
     - name: Semantic Release
       id: semantic_release
       if: ${{ steps.semantic_release_dry_run.outputs.new_release_published == 'true' }}
-      uses: cycjimmy/semantic-release-action@1989a0fefc4aea321e07f717680ed8e345925dc1 # v7.1.2
+      uses: cycjimmy/semantic-release-action@03595b5eaf44910cf239ff20904cc52d410f97d4 # v8.1.2
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
