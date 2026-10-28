@@ -224,7 +224,9 @@ fn create_netlink_socket() -> anyhow::Result<AsyncFd<OwnedFd>> {
     }
 
     let owned_fd = unsafe { OwnedFd::from_raw_fd(raw_fd) };
-    Ok(AsyncFd::new(owned_fd)?)
+    // SAFETY: `owned_fd` is a valid, open socket that is owned by the AsyncFd
+    // and only closed when the AsyncFd is dropped.
+    Ok(unsafe { AsyncFd::register(owned_fd) }?)
 }
 
 /// Drains all buffered netlink messages from the socket. We only need the
