@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::ffi::CStr;
 use std::ffi::CString;
 use std::io::Write;
 use std::ops::Add;
@@ -14,8 +13,6 @@ use anyhow::anyhow;
 use aya::Pod;
 use aya::programs::SchedClassifier;
 use aya::programs::TcAttachType;
-use aya::programs::Xdp;
-use aya::programs::XdpMode;
 use aya::programs::tc::TcError;
 use clap::Parser;
 use env_logger::Target;
@@ -26,6 +23,8 @@ use serde::Serialize;
 use serde_with::DisplayFromStr;
 use serde_with::serde_as;
 use tokio::io::unix::AsyncFd;
+use tokio::signal::unix::SignalKind;
+use tokio::signal::unix::signal;
 
 // Netlink multicast groups for interface and address change notifications
 const RTMGRP_LINK: u32 = 1;
@@ -51,6 +50,11 @@ struct Arguments {
     #[arg(long, default_value = "500")]
     /// Rate at which network metrics are collected from BPF modules and printed to stdout
     pub metrics_rate: u64,
+
+    #[arg(long = "exclude-interface", default_values_t = vec!["lo".to_string()])]
+    /// Interface that gets no counters attached (repeatable). Loopback traffic
+    /// never leaves the pod, and a classifier on `lo` taxes every local packet.
+    pub exclude_interfaces: Vec<String>,
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -111,20 +115,46 @@ async fn main() -> anyhow::Result<()> {
     )
     .await;
 
-    loop {
-        // Block until the kernel sends a netlink notification (interface or
-        // address change), then drain all buffered messages before diffing.
-        let mut guard = netlink_socket.readable().await?;
-        guard.clear_ready();
-        drain_netlink_messages(netlink_socket.get_ref());
+    // Exit through the same path for SIGTERM and SIGINT: dropping the eBPF
+    // objects detaches their programs. Without it the default signal action
+    // killed the process, and on kernels without tcx (<6.6) the netlink TC
+    // filters stayed on the pod's interfaces after snoopy was gone.
+    let mut sigterm = signal(SignalKind::terminate())?;
+    let mut sigint = signal(SignalKind::interrupt())?;
 
-        handle_updates(
-            update_network_interfaces(&mut network_interfaces),
-            &args,
-            &mut ebpf_tasks,
-        )
-        .await;
+    loop {
+        tokio::select! {
+            readable = netlink_socket.readable() => {
+                // Woken by a netlink notification (interface or address
+                // change); drain all buffered messages before diffing.
+                let mut guard = readable?;
+                guard.clear_ready();
+                drain_netlink_messages(netlink_socket.get_ref());
+
+                handle_updates(
+                    update_network_interfaces(&mut network_interfaces),
+                    &args,
+                    &mut ebpf_tasks,
+                )
+                .await;
+            }
+            _ = sigterm.recv() => break,
+            _ = sigint.recv() => break,
+        }
     }
+
+    log::info!(
+        "shutting down, detaching {} ebpf module(s)",
+        ebpf_tasks.len()
+    );
+    for (_, (kill_tx, handle)) in ebpf_tasks.drain() {
+        let _ = kill_tx.send(());
+        if handle.await.is_err() {
+            log::error!("failed to join worker thread");
+        }
+    }
+
+    Ok(())
 }
 
 async fn handle_updates(
@@ -137,6 +167,10 @@ async fn handle_updates(
 
         match event {
             InterfaceUpdate::InterfaceAdded { interface } => {
+                if args.exclude_interfaces.contains(&interface.name) {
+                    log::debug!("not attaching to excluded interface {}", interface.name);
+                    continue;
+                }
                 let (kill_tx, kill_rx) = tokio::sync::oneshot::channel::<()>();
                 let args = args.clone();
                 match initialize_ebpf_for_interface(interface.name.clone()).await {
@@ -304,7 +338,6 @@ pub enum IngressImplementation {
     #[default]
     None,
     Classifier,
-    Xdp,
 }
 
 impl FromStr for IngressImplementation {
@@ -313,7 +346,6 @@ impl FromStr for IngressImplementation {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.to_lowercase().as_str() {
             "classifier" => Ok(IngressImplementation::Classifier),
-            "xdp" => Ok(IngressImplementation::Xdp),
             _ => Err(anyhow::anyhow!("Invalid Ingress Implementation: {s}")),
         }
     }
@@ -344,11 +376,6 @@ async fn initialize_ebpf_for_interface(
     let ebpf_program = aya::include_bytes_aligned!(concat!(env!("OUT_DIR"), "/snoopy"));
     let mut ebpf = aya::Ebpf::load(ebpf_program).with_context(|| "failed to load ebpf program")?;
 
-    if let Err(error) = aya_log::EbpfLogger::init_with_logger(&mut ebpf, log::logger()) {
-        // This can happen if you remove all log statements from your eBPF program.
-        log::warn!("failed to initialize eBPF logger: {error}");
-    }
-
     // aya >= 0.16 identifies interfaces by `&CStr` (or index) instead of `&str`.
     let iface_c = CString::new(iface.as_str())
         .with_context(|| format!("interface name {iface:?} contains a NUL byte"))?;
@@ -364,10 +391,44 @@ async fn initialize_ebpf_for_interface(
         }
     }
 
-    let ingress_impl = attach_ingress_counter(&mut ebpf, &iface_c);
-    let egress_impl = attach_egress_counter(&mut ebpf, &iface_c);
-
-    Ok((ebpf, ingress_impl, egress_impl))
+    // Attach errors used to be dropped with `.is_ok()`, which hid that no
+    // program had loaded at all for months. Report them: a half-attached
+    // interface is logged, a fully failed one fails the initialization so the
+    // operator sees `InterfaceBpfInitializationFailed`.
+    let ingress = attach_classifier(
+        &mut ebpf,
+        "update_tc_ingress",
+        &iface_c,
+        TcAttachType::Ingress,
+    );
+    let egress = attach_classifier(
+        &mut ebpf,
+        "update_tc_egress",
+        &iface_c,
+        TcAttachType::Egress,
+    );
+    match (ingress, egress) {
+        (Err(ingress_error), Err(egress_error)) => Err(anyhow!(
+            "ingress: {ingress_error:#}; egress: {egress_error:#}"
+        )),
+        (ingress, egress) => {
+            let ingress_impl = match ingress {
+                Ok(()) => IngressImplementation::Classifier,
+                Err(error) => {
+                    log::warn!("failed to attach ingress counter to {iface:?}: {error:#}");
+                    IngressImplementation::None
+                }
+            };
+            let egress_impl = match egress {
+                Ok(()) => EgressImplementation::Classifier,
+                Err(error) => {
+                    log::warn!("failed to attach egress counter to {iface:?}: {error:#}");
+                    EgressImplementation::None
+                }
+            };
+            Ok((ebpf, ingress_impl, egress_impl))
+        }
+    }
 }
 
 async fn attach_to_interface(
@@ -412,65 +473,23 @@ async fn attach_to_interface(
     log::info!("closed ebpf module for interface {iface}");
 }
 
-/// Attempt to attach any of the available implementations for counting ingress traffic
-/// and returns the chosen implementation.
-fn attach_ingress_counter(ebpf: &mut aya::Ebpf, iface: &CStr) -> IngressImplementation {
-    if attach_ingress_xdp_counter(ebpf, iface).is_ok() {
-        return IngressImplementation::Xdp;
-    }
-
-    if attach_ingress_classifier_counter(ebpf, iface).is_ok() {
-        return IngressImplementation::Classifier;
-    }
-
-    IngressImplementation::None
-}
-
-/// ingress counter implementation using `XDP`
-fn attach_ingress_xdp_counter(ebpf: &mut aya::Ebpf, iface: &CStr) -> anyhow::Result<()> {
-    let ingress_program: &mut Xdp = ebpf.program_mut("update_xdp_ingress").unwrap().try_into()?;
-    ingress_program.load()?;
-    ingress_program
-        .attach(iface, XdpMode::default())
-        .map_err(|err| anyhow!("failed to attach the XDP program with default mode: {err}"))?;
-
-    Ok(())
-}
-
-/// ingress counter implementation using `Classifier` also known as `Tc`
-fn attach_ingress_classifier_counter(ebpf: &mut aya::Ebpf, iface: &CStr) -> anyhow::Result<()> {
-    let ingress_program: &mut SchedClassifier = ebpf
-        .program_mut("update_tc_ingress")
-        .expect("could not find program with name `update_tc_ingress`")
+/// Loads the named classifier and attaches it to `iface` in `direction`.
+fn attach_classifier(
+    ebpf: &mut aya::Ebpf,
+    program_name: &str,
+    iface: &CString,
+    direction: TcAttachType,
+) -> anyhow::Result<()> {
+    let program: &mut SchedClassifier = ebpf
+        .program_mut(program_name)
+        .with_context(|| format!("could not find program with name `{program_name}`"))?
         .try_into()?;
-    ingress_program.load()?;
-    ingress_program
-        .attach(iface, TcAttachType::Ingress)
-        .map_err(|err| anyhow!("failed to attach the TcAttachType::Ingress program: {err}"))?;
-
-    Ok(())
-}
-
-/// Attempt to attach any of the available implementations for counting egress traffic
-/// and returns the chosen implementation.
-fn attach_egress_counter(ebpf: &mut aya::Ebpf, iface: &CStr) -> EgressImplementation {
-    if attach_egress_classifier_counter(ebpf, iface).is_ok() {
-        return EgressImplementation::Classifier;
-    }
-
-    EgressImplementation::None
-}
-
-/// egress counter implementation using `Classifier` also known as `Tc`
-fn attach_egress_classifier_counter(ebpf: &mut aya::Ebpf, iface: &CStr) -> anyhow::Result<()> {
-    let egress_program: &mut SchedClassifier = ebpf
-        .program_mut("update_tc_egress")
-        .expect("could not find program with name `update_tc_egress`")
-        .try_into()?;
-    egress_program.load()?;
-    egress_program
-        .attach(iface, TcAttachType::Egress)
-        .map_err(|err| anyhow!("failed to attach the TcAttachType::Egress program: {err}"))?;
+    program
+        .load()
+        .with_context(|| format!("failed to load `{program_name}`"))?;
+    program
+        .attach(iface.as_c_str(), direction)
+        .with_context(|| format!("failed to attach `{program_name}` as {direction:?}"))?;
 
     Ok(())
 }
