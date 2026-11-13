@@ -1,12 +1,9 @@
 #![no_std]
 #![no_main]
 
-use aya_ebpf::bindings::xdp_action;
 use aya_ebpf::macros::map;
 use aya_ebpf::maps::PerCpuArray;
 use aya_ebpf::programs::TcContext;
-use aya_ebpf::programs::XdpContext;
-use aya_log_ebpf as log;
 
 #[repr(C)]
 #[derive(Debug, Default, Copy, Clone, PartialEq, Eq)]
@@ -21,113 +18,37 @@ static INGRESS_COUNTER: PerCpuArray<Counter> = PerCpuArray::<Counter>::with_max_
 #[map(name = "EGRESS_COUNTER")]
 static EGRESS_COUNTER: PerCpuArray<Counter> = PerCpuArray::<Counter>::with_max_entries(1, 0);
 
+// Both directions are counted with TC classifiers only. XDP was tried first
+// for ingress before, but attaching an XDP program to a veth clears TSO on
+// its peer (`tx-tcp-segmentation: off [fixed]`), so the host had to segment
+// every packet sent into the pod, and on `lo` it ran as generic XDP on every
+// loopback packet. A classifier sees the same bytes without either cost.
+//
+// There is no aya-log here: the only failure path is a lookup of index 0 in
+// a 1-entry array, which cannot fail, and each loaded object paid a 128 KiB
+// AYA_LOGS ring buffer for it.
+
 #[aya_ebpf::macros::classifier]
 pub fn update_tc_ingress(ctx: TcContext) -> i32 {
-    match try_update_tc_ingress(&ctx) {
-        Ok(_) => {
-            // log::debug!(
-            //     &ctx,
-            //     "TC INGRESS: added packet with {} bytes",
-            //     ctx.data_end() - ctx.data()
-            // );
-        }
-        Err(msg) => {
-            log::error!(&ctx, "TC INGRESS: failed to add packet: {}", msg);
-        }
-    }
-
+    count(&INGRESS_COUNTER, ctx.len() as u64);
     aya_ebpf::bindings::TC_ACT_PIPE
-}
-
-#[inline]
-pub fn try_update_tc_ingress(ctx: &TcContext) -> Result<(), &'static str> {
-    let bytes = ctx.len() as u64;
-
-    let counter = INGRESS_COUNTER
-        .get_ptr_mut(0)
-        .ok_or("failed to get pointer to first entry in INGRESS_COUNTER map")?;
-
-    unsafe {
-        (*counter).packets = (*counter).packets.wrapping_add(1);
-        (*counter).bytes = (*counter).bytes.wrapping_add(bytes);
-    }
-
-    Ok(())
-}
-
-#[aya_ebpf::macros::xdp]
-pub fn update_xdp_ingress(ctx: XdpContext) -> u32 {
-    match try_update_xdp_ingress(&ctx) {
-        Ok(_) => {
-            // log::debug!(
-            //     &ctx,
-            //     "XDP INGRESS: added packet with {} bytes",
-            //     ctx.data_end() - ctx.data()
-            // );
-        }
-        Err(msg) => {
-            log::error!(&ctx, "XDP INGRESS: failed to add packet: {}", msg);
-        }
-    }
-
-    xdp_action::XDP_PASS
-}
-
-#[inline]
-fn try_update_xdp_ingress(ctx: &XdpContext) -> Result<(), &'static str> {
-    // On-wire bytes only — XDP metadata (bpf_xdp_adjust_meta region) is driver/HW
-    // scratch space, not part of the packet, so omit it to match the TC variant
-    // which uses ctx.len().
-    let bytes = ctx.data_end() as u64 - ctx.data() as u64;
-
-    let counter = INGRESS_COUNTER
-        .get_ptr_mut(0)
-        .ok_or("failed to get pointer to first entry in INGRESS_COUNTER map")?;
-
-    unsafe {
-        (*counter).packets = (*counter).packets.wrapping_add(1);
-        (*counter).bytes = (*counter).bytes.wrapping_add(bytes);
-
-        // info!(ctx, "XDP INGRESS: Packets: {}, Bytes: {}", (*counter).packets, (*counter).bytes);
-    }
-
-    Ok(())
 }
 
 #[aya_ebpf::macros::classifier]
 pub fn update_tc_egress(ctx: TcContext) -> i32 {
-    match try_update_tc_egress(&ctx) {
-        Ok(_) => {
-            // log::debug!(
-            //     &ctx,
-            //     "TC EGRESS: added packet with {} bytes",
-            //     ctx.data_end() - ctx.data()
-            // );
-        }
-        Err(msg) => {
-            log::error!(&ctx, "TC EGRESS: failed to add packet: {}", msg);
-        }
-    };
-
+    count(&EGRESS_COUNTER, ctx.len() as u64);
     aya_ebpf::bindings::TC_ACT_PIPE
 }
 
-#[inline]
-pub fn try_update_tc_egress(ctx: &TcContext) -> Result<(), &'static str> {
-    let data = ctx.data() as u64;
-    let data_end = ctx.data_end() as u64;
-    let bytes = data_end - data;
-
-    let counter = EGRESS_COUNTER
-        .get_ptr_mut(0)
-        .ok_or("failed to get pointer to first entry in EGRESS_COUNTER map")?;
-
-    unsafe {
-        (*counter).packets = (*counter).packets.wrapping_add(1);
-        (*counter).bytes = (*counter).bytes.wrapping_add(bytes);
+#[inline(always)]
+fn count(map: &PerCpuArray<Counter>, bytes: u64) {
+    if let Some(counter) = map.get_ptr_mut(0) {
+        // SAFETY: per-CPU map slot; programs on one CPU never run concurrently.
+        unsafe {
+            (*counter).packets = (*counter).packets.wrapping_add(1);
+            (*counter).bytes = (*counter).bytes.wrapping_add(bytes);
+        }
     }
-
-    Ok(())
 }
 
 #[cfg(not(test))]
