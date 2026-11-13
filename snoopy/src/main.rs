@@ -55,6 +55,31 @@ struct Arguments {
     /// Interface that gets no counters attached (repeatable). Loopback traffic
     /// never leaves the pod, and a classifier on `lo` taxes every local packet.
     pub exclude_interfaces: Vec<String>,
+
+    #[arg(long = "interface-prefix", default_values_t = vec!["eth".to_string(), "net".to_string()])]
+    /// Only interfaces named <prefix><digits> get counters attached (repeatable).
+    /// The defaults are a pod's uplinks: eth<N> from the CNI and net<N> from
+    /// Multus. Bridges and veths of nested runtimes (docker-in-docker, kind)
+    /// carry traffic that crosses eth0 as well, and each new veth cost an
+    /// eBPF load.
+    pub interface_prefixes: Vec<String>,
+}
+
+impl Arguments {
+    fn should_attach(&self, name: &str) -> bool {
+        if self
+            .exclude_interfaces
+            .iter()
+            .any(|excluded| excluded == name)
+        {
+            return false;
+        }
+        self.interface_prefixes.iter().any(|prefix| {
+            name.strip_prefix(prefix.as_str()).is_some_and(|suffix| {
+                !suffix.is_empty() && suffix.bytes().all(|b| b.is_ascii_digit())
+            })
+        })
+    }
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -92,10 +117,10 @@ async fn main() -> anyhow::Result<()> {
     let ret = unsafe { libc::setrlimit(libc::RLIMIT_MEMLOCK, &rlim) };
     if ret != 0 {
         // On modern kernels (≥5.11) eBPF memory accounting is cgroup-based and
-        // RLIMIT_MEMLOCK is irrelevant. Failing here is not fatal; we log a warning
+        // RLIMIT_MEMLOCK is irrelevant. Failing here is not fatal; we log it at debug
         // and continue. Without CAP_SYS_RESOURCE (e.g. when privileged:true is not
         // set) this call will fail on most container runtimes — that is acceptable.
-        log::warn!(
+        log::debug!(
             "setrlimit(RLIMIT_MEMLOCK, RLIM_INFINITY) failed (ret={}): running without raised memlock limit; this is fine on kernels ≥5.11",
             ret
         );
@@ -167,8 +192,8 @@ async fn handle_updates(
 
         match event {
             InterfaceUpdate::InterfaceAdded { interface } => {
-                if args.exclude_interfaces.contains(&interface.name) {
-                    log::debug!("not attaching to excluded interface {}", interface.name);
+                if !args.should_attach(&interface.name) {
+                    log::debug!("not attaching to interface {}", interface.name);
                     continue;
                 }
                 let (kill_tx, kill_rx) = tokio::sync::oneshot::channel::<()>();
@@ -206,7 +231,9 @@ async fn handle_updates(
                 }
             }
             InterfaceUpdate::InterfaceRemoved { interface } => {
-                log::info!("interface was removed: {interface:?}");
+                // Interface events are printed to stdout already; repeating
+                // them on stderr at info level only flooded the operator log.
+                log::debug!("interface was removed: {interface:?}");
                 if let Some((_, (kill_tx, handle))) =
                     ebpf_tasks.remove_entry(interface.name.as_str())
                 {
@@ -217,7 +244,7 @@ async fn handle_updates(
                 }
             }
             InterfaceUpdate::InterfaceChanged { previous, new } => {
-                log::info!("interface changed: {previous:?} -> {new:?}");
+                log::debug!("interface changed: {previous:?} -> {new:?}");
             }
         }
     }
@@ -470,7 +497,7 @@ async fn attach_to_interface(
         }
     }
 
-    log::info!("closed ebpf module for interface {iface}");
+    log::debug!("closed ebpf module for interface {iface}");
 }
 
 /// Loads the named classifier and attaches it to `iface` in `direction`.
