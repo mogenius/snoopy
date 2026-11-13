@@ -1,4 +1,6 @@
 use std::collections::HashMap;
+use std::ffi::CStr;
+use std::ffi::CString;
 use std::io::Write;
 use std::ops::Add;
 use std::os::unix::io::AsRawFd;
@@ -347,7 +349,11 @@ async fn initialize_ebpf_for_interface(
         log::warn!("failed to initialize eBPF logger: {error}");
     }
 
-    if let Err(error) = aya::programs::tc::qdisc_add_clsact(iface.as_str()) {
+    // aya >= 0.16 identifies interfaces by `&CStr` (or index) instead of `&str`.
+    let iface_c = CString::new(iface.as_str())
+        .with_context(|| format!("interface name {iface:?} contains a NUL byte"))?;
+
+    if let Err(error) = aya::programs::tc::qdisc_add_clsact(iface_c.as_c_str()) {
         let already_exists = matches!(
             &error,
             TcError::NetlinkError(netlink_error)
@@ -358,8 +364,8 @@ async fn initialize_ebpf_for_interface(
         }
     }
 
-    let ingress_impl = attach_ingress_counter(&mut ebpf, iface.as_str());
-    let egress_impl = attach_egress_counter(&mut ebpf, iface.as_str());
+    let ingress_impl = attach_ingress_counter(&mut ebpf, &iface_c);
+    let egress_impl = attach_egress_counter(&mut ebpf, &iface_c);
 
     Ok((ebpf, ingress_impl, egress_impl))
 }
@@ -408,7 +414,7 @@ async fn attach_to_interface(
 
 /// Attempt to attach any of the available implementations for counting ingress traffic
 /// and returns the chosen implementation.
-fn attach_ingress_counter(ebpf: &mut aya::Ebpf, iface: &str) -> IngressImplementation {
+fn attach_ingress_counter(ebpf: &mut aya::Ebpf, iface: &CStr) -> IngressImplementation {
     if attach_ingress_xdp_counter(ebpf, iface).is_ok() {
         return IngressImplementation::Xdp;
     }
@@ -421,7 +427,7 @@ fn attach_ingress_counter(ebpf: &mut aya::Ebpf, iface: &str) -> IngressImplement
 }
 
 /// ingress counter implementation using `XDP`
-fn attach_ingress_xdp_counter(ebpf: &mut aya::Ebpf, iface: &str) -> anyhow::Result<()> {
+fn attach_ingress_xdp_counter(ebpf: &mut aya::Ebpf, iface: &CStr) -> anyhow::Result<()> {
     let ingress_program: &mut Xdp = ebpf.program_mut("update_xdp_ingress").unwrap().try_into()?;
     ingress_program.load()?;
     ingress_program
@@ -432,7 +438,7 @@ fn attach_ingress_xdp_counter(ebpf: &mut aya::Ebpf, iface: &str) -> anyhow::Resu
 }
 
 /// ingress counter implementation using `Classifier` also known as `Tc`
-fn attach_ingress_classifier_counter(ebpf: &mut aya::Ebpf, iface: &str) -> anyhow::Result<()> {
+fn attach_ingress_classifier_counter(ebpf: &mut aya::Ebpf, iface: &CStr) -> anyhow::Result<()> {
     let ingress_program: &mut SchedClassifier = ebpf
         .program_mut("update_tc_ingress")
         .expect("could not find program with name `update_tc_ingress`")
@@ -447,7 +453,7 @@ fn attach_ingress_classifier_counter(ebpf: &mut aya::Ebpf, iface: &str) -> anyho
 
 /// Attempt to attach any of the available implementations for counting egress traffic
 /// and returns the chosen implementation.
-fn attach_egress_counter(ebpf: &mut aya::Ebpf, iface: &str) -> EgressImplementation {
+fn attach_egress_counter(ebpf: &mut aya::Ebpf, iface: &CStr) -> EgressImplementation {
     if attach_egress_classifier_counter(ebpf, iface).is_ok() {
         return EgressImplementation::Classifier;
     }
@@ -456,7 +462,7 @@ fn attach_egress_counter(ebpf: &mut aya::Ebpf, iface: &str) -> EgressImplementat
 }
 
 /// egress counter implementation using `Classifier` also known as `Tc`
-fn attach_egress_classifier_counter(ebpf: &mut aya::Ebpf, iface: &str) -> anyhow::Result<()> {
+fn attach_egress_classifier_counter(ebpf: &mut aya::Ebpf, iface: &CStr) -> anyhow::Result<()> {
     let egress_program: &mut SchedClassifier = ebpf
         .program_mut("update_tc_egress")
         .expect("could not find program with name `update_tc_egress`")
